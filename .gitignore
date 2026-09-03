@@ -1,0 +1,30 @@
+# nix-build output symlinks (point into /nix/store, meaningless elsewhere)
+result
+result-*
+
+# Build artifacts: kernels, U-Boot binaries, uImages, disk images.
+# All reproducible from the .nix files in kernel/, uboot/ and nixos/.
+kernel/out/
+uboot/out/
+nixos/out/
+
+# Serial captures and nix build logs. Large, machine-specific, and append-only.
+# PORTING.md quotes the load-bearing excerpts inline rather than pointing at these
+# files, so nothing in the docs depends on them being present.
+logs/
+*.log
+
+# Local binary cache populated during bring-up. Rebuildable, and large.
+nix-cache/
+
+# Second copy of the flash backup. Verified byte-identical to flash-backup/ with
+# `diff -rq`, so committing it twice buys nothing - git already gives us history
+# and integrity. Kept on disk as the off-git second copy the M1 safety net wants.
+flash-backup-copy2/
+
+# Disk images written to USB
+*.img
+
+# Python bytecode from running gen-driver-modules.py
+__pycache__/
+*.pyc

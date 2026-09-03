@@ -1,0 +1,39 @@
+# DS410j stock flash backup
+# captured 2026-09-02T22:58:31Z from the running mainline kernel via /dev/mtdN
+# device model DS410j, serial A5G7N01773D, MAC 00:11:32:02:f9:a6
+# NOTE: mtd0 is labelled 'RedBoot' but contains Marvell U-Boot 1.1.4.
+# Verified: device-side md5 == host-side md5 for all six partitions.
+
+## sizes
+mtd0.bin 524288
+mtd1.bin 2097152
+mtd2.bin 1310720
+mtd3.bin 65536
+mtd4.bin 131072
+mtd5.bin 65536
+
+## md5 (matches device-side)
+92a64d4550afa76bf1f44e1c9e2663ca  mtd0.bin
+a4fd1b47c07b2e18b114f0472523cd59  mtd1.bin
+75a04682bed20c6901eef1c85336059e  mtd2.bin
+cc15424e226bb735ab76d30383e4f214  mtd3.bin
+0dfbe8aa4c20b52e1b8bf3cb6cbdf193  mtd4.bin
+437b5ca21891d89728ef31703cc65c41  mtd5.bin
+
+## sha256
+14bd2883e67a276907580e5aceabca297e6a373f4231e7065f16fb499ad750db  mtd0.bin
+febf984ceb82f35404d9dd8864b120e09abf88c1791164d41a2cadc6a00b35b6  mtd1.bin
+d933c46d79d7eebdd58c700ac87197d0c416f8642078729988fad880aae7ca78  mtd2.bin
+7a815a17ad197430a126ea6cf7befa53c7f30b633ed9e4fc67c5ed6341ddcae1  mtd3.bin
+fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471  mtd4.bin
+6eef35ced2e612b17f8ea240304ce9e5d47e80169c1652a1578f28678cb6199f  mtd5.bin
+
+## full-chip image (concatenation of mtd0..mtd5; partitions are contiguous, no gaps)
+ds410j-flash-full-4MB.bin
+  size   : 4194304 (0x400000)
+  crc32  : 8bc4bbb7
+  md5    : 2d30602f0293d92432c82f3b3626b6c5
+  sha256 : 234780f9896ddf61102c173fccc8cb8556b404b0a040ddcc169d761975cf5720
+  NOTE: suitable for whole-chip reflash via external SPI programmer (ST M25P32).
+  NOTE: bootcmd default lives at offset 0x71582 inside mtd0 (compiled into U-Boot).
+  NOTE: mtd4 is all 0x00 (zeroed, not erased); mtd5 holds a real RedBoot FIS directory.
