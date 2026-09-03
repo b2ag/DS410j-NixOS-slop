@@ -26,11 +26,11 @@ regression test. Amber is the only colour an empty bay can show.
 
 
 **Two things are parked mid-investigation** and are listed at the top of
-`PORTING.md` under "Unfinished, and easy to forget": the **kwboot / BootROM
-recovery test** (inconclusive; retest raw, and ideally with the serial adapter on
-a real host rather than through USB passthrough) and **what set
-power-on-at-AC-restore** (cause entirely unknown - the MCU is one guess among
-several, not a finding). Read that list before starting anything new.
+`PORTING.md` under "Unfinished, and easy to forget". The live one is **the power
+button**: DSM shuts the box down on a short press, we cannot see it, and the best
+untried step is reading the *stock* loader MPP config at the `Marvell>>` prompt.
+The others are the inconclusive **kwboot** test and **what set
+power-on-at-AC-restore**. Read that list before starting anything new.
 
 **The box can now be power-cycled remotely** - `kernel/ds410j-power.sh cycle`,
 verified end to end. "Every reset needs a human at the button" is no longer true,

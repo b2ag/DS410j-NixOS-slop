@@ -220,6 +220,26 @@ check "cool bay: green on"       1 "$(led green 3)"
 check "cool bay: amber off"      0 "$(led amber 3)"
 check "empty bay: both dark (g)" 0 "$(led green 2)"
 check "empty bay: both dark (a)" 0 "$(led amber 2)"
+
+echo
+echo "logging reflects what changed"
+# Speed-only logging hid the fact that drives had appeared: the boot-time
+# "(0/0)" line stayed the last word because baseline covers both cases.
+cat > "$ROOT/runlog" <<'STUB'
+STUB
+BOARD=40000 fake_tree                       # no drives
+SYSROOT="$ROOT" POLL=1 BOARD_ESCALATE_C=55 sh ./ds410j-fan-control.sh > "$ROOT/log2" 2>&1 &
+lg=$!
+sleep 2
+# drives appear late, exactly as they do on the real board (~110s to enumerate)
+BOARD=40000 fake_tree 1:40000 3:38000
+sleep 4
+kill "$lg" 2>/dev/null; wait "$lg" 2>/dev/null
+if grep -q "(0/0)" "$ROOT/log2" && grep -q "(2/2)" "$ROOT/log2"; then
+  echo "  ok    logged both the blind first poll and the drives appearing"; pass=$((pass+1))
+else
+  echo "  FAIL  expected both (0/0) and (2/2) lines; got:"; sed 's/^/        /' "$ROOT/log2"; fail=$((fail+1))
+fi
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

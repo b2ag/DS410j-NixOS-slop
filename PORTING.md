@@ -55,7 +55,7 @@ after checking, and say what you checked against.
 
 ## Unfinished, and easy to forget
 
-Two things are parked mid-investigation. Both are written up in full further
+Three things are parked mid-investigation. All are written up in full further
 down; this list exists so they are not lost.
 
 1. **kwboot / BootROM recovery — INCONCLUSIVE, retest wanted.** (§7.3,
@@ -73,6 +73,15 @@ down; this list exists so they are not lost.
    the change is real; the cause is not known and the MCU is only one guess among
    several. It is useful and we would not want to undo it by accident, but we can
    neither reproduce it deliberately nor reverse it.
+
+3. **The power button does not work, and finding it is the top priority.** (§7.1)
+   DSM shuts the box down on a short press, so a mechanism exists. Every
+   input-capable SoC GPIO has now been tested via `gpio-keys` except six, and the
+   MCU never transmits. The best untried step is reading the **stock** loader's
+   MPP configuration at the `Marvell>>` prompt (`md 0xF1010000 8`) and diffing it
+   against the DS109 table our U-Boot applies — direct evidence instead of
+   inference. Second: the six untested pins (MPP29/30/31/34/44/45) are drive
+   power enables, so test them **with the bays empty**.
 
 Everything else outstanding is in §7.
 ---
@@ -761,44 +770,54 @@ partition 2 shows the `FDT` line (`OPERATIONS.md`).
   avenue is that the same MCU accepts a reset command — worth tracing what the
   Synology variant of `POWER_RESET_QNAP` does [VERIFY]. For a headless 24/7 NAS
   this matters as much as poweroff did.
-- **The front-panel buttons appear not to be software-visible at all** [LIKELY,
-  with one blind spot below]. `PORTING.md` previously said "`gpio-keys` nodes
-  exist in `kirkwood-synology.dtsi`" — **they do not**. There is no `gpio-keys`,
-  `gpio_keys`, `linux,code` or `KEY_*` anywhere in the Marvell Kirkwood tree, so
-  there was never anything to enable. That claim was wrong and is withdrawn.
+- **The front-panel buttons are still not visible to software** [CONFIRMED for
+  everything tested; one gap remains, below]. DSM shuts this box down cleanly on
+  a short press [CONFIRMED by the owner, twice], so a mechanism exists. We have
+  not found it.
 
-  The kernel side needs nothing: `CONFIG_KEYBOARD_GPIO=y`, `INPUT_EVDEV=y` and
-  logind's default `HandlePowerKey=poweroff` are all in place. There are simply
-  no input devices and no `/dev/input`, because nothing declares a button. What
-  is missing is a pin — and the evidence says there isn't one:
-
-  | test | result |
+  | tried | result |
   |---|---|
-  | `ds410j-bench.sh button hunt`, 39 unclaimed GPIO lines | no change on either button |
-  | `mcu listen`, power **and** reset pressed | `rx:0` — the MCU says nothing |
-  | 10-second hold on the power button | no power-off; the MCU does not act either |
-  | DSM kernel, 6883 symbol strings | **zero** button/btn/keypad symbols |
-  | DSM `SYNO_CTRL_*` set (10 entries) | no button entry; LEDs, fan, buzzer only |
-  | `ds410j_synobios.ko` | no button functions; `GetGpioPin` called only by `GetFanSpeedBits` |
-  | `synoinfo.conf` | `usbcopy="no"`, and no `support_*button*` key |
+  | MCU on UART1, `mcu listen`, power **and** reset pressed | `rx:0` — never transmits |
+  | ...same, after `4` told the MCU the system was up | `rx:0` |
+  | 10-second hold on the power button | nothing; the MCU does not act either |
+  | I2C bus | only the RTC (0x32) and the LM75 (0x48) |
+  | `gpio-keys` round 1: MPP12, 20, 21 | no events |
+  | `gpio-keys` round 2: MPP4, 22-28, 32, 35, 46-49 | no events |
+  | DSM kernel, 6883 symbol strings | no button/gpio-keys/`KEY_*` anywhere |
+  | DSM `SYNO_CTRL_*` (10 entries) | LEDs, fan, buzzer, HDD power — no button |
+  | `synoinfo.conf` | `usbcopy="no"`, no `support_*button*` key |
 
-  scemd's `event_microp.c` does handle "power button pressed", but that is
-  generic scemd code compiled for every model; on this one nothing ever feeds it.
-  Consistent with the rest of the DS410j's character - the same model whose
-  synobios stubs out every LED setter.
+  Ruled out by construction, not by test: MPP5, 7, 18, 19, 33 are `gpo` on every
+  88F6281 variant and can never be an input; 0-3, 8-11, 13-14 are SPI/i2c/uart;
+  15-17 and 36-43 are the fan and bay LEDs.
 
-  **The blind spot**, and it is a real one: `pinmux-pins` shows most pins as
-  `(MUX UNCLAIMED)`, meaning Linux never muxed them and they hold whatever U-Boot
-  left. `gpioget` only reflects the pad when a pin is genuinely in gpio mode, so
-  a button on a pin sitting in some other MPP function would be invisible to
-  `button hunt`. Closing it means reading the MPP registers — `/dev/mem` is
-  present but `CONFIG_STRICT_DEVMEM=y` blocks MMIO, so it wants `md 0xF1010000 8`
-  at the U-Boot prompt. Worth doing on the next reboot, since if a pin turns out
-  to be muxed away from gpio, muxing it back is exactly what a board-specific DTS
-  is for. Until then this is [LIKELY], not settled.
+  **The one gap: MPP29, 30, 31, 34, 44, 45.** All six ARE gpio-capable on the
+  6281, and all six are untested — they were excluded because
+  `kirkwood-synology.dtsi` names them `pmx_hdd*_pwr_*`, drive power enables, and
+  flipping a live one to input could cut power to a fitted disk. That exclusion
+  was right, but it means the search is not actually exhaustive. Testing them
+  safely means doing it **with the bays empty**.
 
-  Also untested: whether the MCU needs telling to *enable* button reporting. That
-  would be another unmapped command character.
+  **The best untried lead is the stock bootloader's own pinmux.** Our U-Boot is
+  `ds109_defconfig` and applies the DS109 MPP table, which is why MPP12/20/21
+  were unreadable in the first place. The *stock* Marvell U-Boot configures MPP
+  for a real DS410j. Interrupt it at the `Marvell>>` prompt and read the mux
+  registers directly:
+
+  ```
+  md 0xF1010000 8        # MPP_CTRL0..7, 4 bits per pin
+  ```
+
+  Any pin the stock loader sets to gpio that ours does not is a candidate, and
+  this is direct evidence about the actual hardware rather than inference from
+  another board's table. It has never been done. `/dev/mem` cannot substitute -
+  `CONFIG_STRICT_DEVMEM=y` blocks MMIO from Linux.
+
+  Also untried: whether the MCU needs an unmapped command to *enable* button
+  reporting. Against that theory - the MCU looks like a timing peripheral (it
+  owns LED blink rates and beep lengths autonomously, with no host traffic while
+  a lamp blinks), and such a device plausibly was never designed to report
+  anything, which would explain `rx:0` as intent rather than defect.
 - **CESA and `mv_xor`.** Untested. CESA matters for §7.2.
 ### 7.2 LUKS
 

@@ -66,6 +66,7 @@ idx=$NSPEEDS    # start at the top speed so a first pass that cannot read
 escalated=0     # anything fails safe. escalated stays 0 so hysteresis cannot
                 # hold that artificial value against the first real reading.
 last_written=""
+last_state=""
 last_status=""
 
 log() { echo "ds410j-fan: $*"; }
@@ -268,13 +269,27 @@ EOF
 
   idx=$want
   rpm=$(nth "$idx" "$SPEEDS")
+
   if [ "$rpm" != "$last_written" ]; then
     if echo "$rpm" > "$fan" 2>/dev/null; then
-      log "board ${board_t:-?}C, drives max ${maxd}C ($n_readable/$n_present) -> ${rpm} rpm"
       last_written=$rpm
     else
       log "WARNING: failed to write $rpm to $fan"
     fi
+  fi
+
+  # Log on a change of speed OR of what we can see. Logging only on speed change
+  # was actively misleading: this board's SATA drives can take ~110 s to
+  # enumerate (ata3 "link is slow to respond", then SRST failed), so the first
+  # poll is routinely blind and prints "(0/0)". If the speed then never changes -
+  # which it does not, since baseline covers both cases - that stale line stays
+  # the last word for as long as the box is up, and the log looks current while
+  # being wrong. Board temperature is deliberately NOT part of the key, or every
+  # poll would log.
+  state="$rpm|$n_readable/$n_present"
+  if [ "$state" != "$last_state" ]; then
+    log "board ${board_t:-?}C, drives max ${maxd}C ($n_readable/$n_present) -> ${rpm} rpm"
+    last_state=$state
   fi
 
   # Front-panel status lamp: orange if anything is at or above its warn level,

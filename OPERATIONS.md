@@ -552,7 +552,7 @@ after every build, because the store path is awkward to reach from the host.
 
 ```sh
 IMG=/src/nixos/out/ds410j-nixos.img
-sha256sum "$IMG"          # 3d82eda184355922c3ebc808cdeac95bc054b7235e35194e7ae1536572b76d6f
+sha256sum "$IMG"          # 7df4f9fd2273d904975f84bdb6652af76b4f8e4f41092da9babbc3bdba55de0d
 sudo dd if="$IMG" of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
