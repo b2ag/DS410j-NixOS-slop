@@ -14,8 +14,23 @@ Read both before touching flash.
 | TFTP server | dnsmasq, `enable-tftp`, root **`/var/lib/tftpboot`** (writable) |
 | DHCP pool (unused; we use static) | 192.168.50.100-200 |
 
-The DS410j bootloader env is **RAM-only** (no `saveenv`), so `ipaddr`/`serverip`/
-`netmask` must be re-set after **every** power cycle.
+The **stock** bootloader's env is RAM-only (no `saveenv`), so `ipaddr`/`serverip`/
+`netmask` must be re-set after every power cycle when working at the `Marvell>>`
+prompt. Our U-Boot has a real environment in mtd4 and remembers them.
+
+### Physical state of the bench
+
+Worth knowing before interpreting anything, and easy to get wrong from a log alone:
+
+- **Drives in bays 2 and 4** (two Toshiba DT01ACA300 3 TB). They enumerate as `ata2`
+  and `ata4`, with `ata3: SATA link down` for the empty bay. Bays 1 and 3 were used
+  earlier; the mapping is 1:1 either way.
+- **The USB stick is the boot device**, written from `/src/nixos/out/ds410j-nixos.img`.
+  It appears as `sda` in Linux, ahead of the SATA disks.
+- The box takes a DHCP lease from the bench dnsmasq (192.168.50.100-200), so its
+  address is **not** the `192.168.50.50` that U-Boot uses.
+- Root password on the serial console is `ds410j` - a v1 placeholder, see
+  `nixos/configuration.nix`.
 
 ## Helper scripts (`/src/kernel/`)
 
@@ -34,7 +49,7 @@ stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb -crtscts -ixon -ixoff raw -echo
 setsid /src/kernel/serlog.sh & disown
 ```
 
-## Gotchas that cost real time today
+## Gotchas that have cost real time
 
 1. **Exactly one reader on the console.** Two `cat` processes silently steal each
    other's bytes and you get plausible-looking garbled output
@@ -124,10 +139,60 @@ bootm 0x04000000 0xF8280000
 ```
 
 Expect `## Booting image at 04000000`, `Load Address: 02000000`, `Verifying Checksum
-... OK`, then `## Loading Ramdisk Image at f8280000` naming
-`synology_88f6281_410j 5967` with its own `Verifying Checksum ... OK`, then the
-U-Boot 2026.07 banner. `uImage-ub-kernel-oldcfg` is the same wrapper around the
-pre-10.9 binary, to bisect if the `SKIP_LOWLEVEL_INIT_ONLY` change is implicated.
+... OK`, then `## Loading Ramdisk Image at f8280000` naming the ramdisk stub with its
+own `Verifying Checksum ... OK`, then the U-Boot 2026.07 banner.
+
+## Iterating on U-Boot
+
+`nix-build /src/uboot` produces a raw `u-boot.bin`. Two ways to run it:
+
+- **`go`** takes the raw binary. Fast, but it inherits the running U-Boot's state -
+  in particular **already-powered USB hub ports**, so it cannot reproduce cold-boot
+  USB behaviour (PORTING.md §5.2). Never validate a USB fix this way.
+- **`bootm`** needs a uImage wrapper, and is the path the flashed payload actually
+  takes. Use this for anything you intend to flash.
+
+Wrapping for `bootm` - note `mkimage` cannot run on `/src` (gotcha 5):
+
+```sh
+nix-build /src/uboot -o /src/uboot/result
+cp -fL /src/uboot/result/u-boot.bin /tmp/ub.bin
+mkimage -A arm -O linux -T kernel -C none -a 0x02000000 -e 0x02000000         -n 'U-Boot 2026.07 DS410j' -d /tmp/ub.bin /tmp/uImage-ub
+cp /tmp/ub.bin /tmp/uImage-ub /var/lib/tftpboot/
+```
+
+`-T kernel` is not cosmetic: `IH_TYPE_STANDALONE` does not work here, and
+`-a`/`-e` must both be `0x02000000` to match `CONFIG_TEXT_BASE` (PORTING.md §4).
+`mkimage` is at `$(nix-build '<nixpkgs>' -A ubootTools --no-out-link)/bin/mkimage`.
+
+For USB or hub problems there is a diagnostic build that defines `DEBUG` in the USB
+core, so `usb start` prints per-port status and every control transfer:
+
+```sh
+nix-build /src/uboot --arg debugUsb true -o /src/uboot/result-debug
+```
+
+It is far too verbose to flash, and remember that its printfs supply timing that a
+normal build does not - a fix that only works in the debug build is not a fix.
+
+### Flashing a new U-Boot
+
+Rehearse with `bootm` on a **cold** boot first, then, from the resulting U-Boot:
+
+```
+sf probe
+tftpboot 0x03000000 uImage-ub          # then crc32 0x03000000 <len> and compare
+sf protect unlock 0 0x400000
+sf erase 0x80000 0x200000
+sf write 0x03000000 0x80000 <len>
+sf read 0x03800000 0x80000 <len>       # crc32 again, must match
+sf protect lock 0 0x400000
+sf erase 0x3F0000 0x10000              # MUST fail: "flash area is locked"
+```
+
+Then re-read mtd0/mtd2/mtd3/mtd5 and compare against PORTING.md §2. Predict every
+checksum offline *before* writing; a matching whole-chip crc32 is what proves
+nothing else moved.
 
 Verify flash is untouched (from the stock loader):
 
@@ -228,38 +293,28 @@ The checklist below still governs every future write.
 - [ ] `sf protect unlock 0 0x400000` first, and **re-lock as soon as it verifies**
       (gotcha 8) - unlocking necessarily exposes mtd0 too.
 
-## Open questions to settle BEFORE flashing
+## Decisions already settled
 
-1. ~~**`CONFIG_TEXT_BASE` for the flashed image.**~~ **Settled** (PORTING.md §4).
-   TEXT_BASE stays `0x02000000` - the address 10.7 already proved - and the image is
-   wrapped as `IH_TYPE_KERNEL` with `-a 0x02000000 -e 0x02000000`, so `bootm` memmoves
-   the payload exactly there. `0x02000000` is clear of the running stock loader
-   (`0x00600000`-`0x0068B3B4`) and of the reserved low 8 MB.
-   **Do not use `IH_TYPE_STANDALONE`**: for that type U-Boot 1.1.4 overwrites `ih_load`
-   with the second `bootm` argument, so the payload would be memmoved into the SPI NOR
-   window at `0xF8280000` and entered at an address never written.
-2. ~~**Cache state differs between `go` and `bootm`.**~~ **Settled, both ends.** The
-   `IH_TYPE_KERNEL` path runs `cleanup_before_linux()` (disable interrupts, disable
-   I-cache, D-cache and L2, invalidate) before entering the payload, and the payload
-   now runs `cpu_init_crit` itself via `CONFIG_SKIP_LOWLEVEL_INIT_ONLY`
-   (PORTING.md §5.1). Still **rehearse with `bootm`, not `go`.**
-3. ~~**Writing mtd1 destroys the ability to boot stock DSM.**~~ **Done, and not a
-   concern** - DSM is expendable by project decision (CLAUDE.md, "What we are
-   protecting"). The thing to protect is the two-stage chain, not the stock OS.
-4. **NEW: mtd2 is now load-bearing for *our* boot chain too.** The `IH_TYPE_KERNEL`
-   hook makes the stock `bootcmd`'s second argument a real ramdisk argument, and
-   Synology's `rd.gz` at `0xF8280000` is what satisfies it (valid `LINUX/ARM/RAMDISK/gzip`
-   uImage, both CRCs OK). If mtd2 is ever erased or corrupted, `bootm` `do_reset()`s and
-   the box boot-loops. **Leave mtd2 alone**, or replace it with an equally valid ramdisk
-   uImage in the same write.
+All of these were open before the first flash write and are now closed; the reasoning
+lives in `PORTING.md` and is not repeated here.
+
+- **Payload type and load address** - `IH_TYPE_KERNEL` at `0x02000000`, never
+  `IH_TYPE_STANDALONE` (§4).
+- **Cache state at handover** - `cleanup_before_linux()` on the way out plus
+  `CONFIG_SKIP_LOWLEVEL_INIT_ONLY` on the way in (§5.1). Still rehearse with `bootm`,
+  not `go`.
+- **Losing stock DSM** - accepted by project decision; the two-stage chain is what is
+  protected, not the stock OS (CLAUDE.md, "What we are protecting").
+- **mtd2 is load-bearing for our own chain** - it now holds our 685-byte ramdisk stub
+  rather than Synology's `rd.gz`, and must never be merely blank (§4).
 
 ## Risk ranking of the candidate writes
 
 | Target | Risk | Recovery if it goes wrong |
 |---|---|---|
-| **mtd4** (env, 0x3D0000) | **lowest** - all zeros today, and the stock loader provably never reads it (PORTING.md §5.4: built with `CFG_ENV_IS_NOWHERE`) | Re-flash 128 KB from backup; stock loader unaffected either way |
+| **mtd4** (env, 0x3D0000) | **lowest** - the stock loader provably never reads it (PORTING.md §5.4: built with `CFG_ENV_IS_NOWHERE`), so a bad env can only affect stage 2 | Re-flash 128 KB, or erase it so U-Boot falls back to its built-in defaults |
 | **mtd1** (our U-Boot, 0x80000) | **low** - stock loader at offset 0 is untouched and still TFTP-boots | Re-flash over TFTP+Linux via the stock loader; the chain's stage 1 is what makes this safe |
-| **mtd2** (ramdisk arg, 0x280000) | **medium** - a *blank* mtd2 boot-loops instead of dropping to a prompt | Interrupt autoboot with `spam.sh` (bootdelay=3 still applies each loop), then TFTP |
+| **mtd2** (ramdisk arg, 0x280000) | **medium** - a *blank* mtd2 boot-loops instead of dropping to a prompt | Interrupt autoboot with `spam.sh` (bootdelay=3 still applies on each loop), then TFTP. `uboot/out/stub-ramdisk.uimg` is regenerable from `uboot/default.nix` |
 | **mtd0** (bootloader, 0x0) | **HIGH - do not** | External SPI programmer only (desolder). Full-chip image is `ds410j-flash-full-4MB.bin` |
 
 Prefer mtd4, then mtd1. `PORTING.md` §4 has the reasoning; mtd0 is a last
