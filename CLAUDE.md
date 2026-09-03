@@ -4,33 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-A single planning document, `PORTING.md`: a brief for porting mainline Linux + NixOS onto a
-Synology DS410j (Marvell Kirkwood 88F6281, armv5tel, 118 MB usable RAM, **Marvell
-U-Boot 1.1.4** bootloader, 4 MB SPI NOR flash).
+Porting mainline Linux + NixOS onto a Synology DS410j (Marvell Kirkwood 88F6281,
+armv5tel, 118 MB usable RAM, **Marvell U-Boot 1.1.4** bootloader, 4 MB SPI NOR flash).
 
-**Status: bring-up done, no NixOS yet.** There is a nix build for the kernel
-(`kernel/default.nix`, two variants) and for U-Boot (`uboot/default.nix`), plus helper
-scripts and verified flash backups. There is still no git history and no tests.
-A hand-written `kirkwood-ds410j.dts` turned out **not** to be needed to boot - mainline's
-`kirkwood-ds409.dts` already declares `synology,ds410j`. The remaining big piece is the
-cross-compiled NixOS configuration (M5).
+**Status: working.** The box cold-boots unattended to NixOS 26.11 on kernel 6.12.104 -
+serial login and ssh, `systemctl is-system-running` reports `running` with zero failed
+units. There are nix builds for the kernel (`kernel/`), U-Boot (`uboot/`) and the
+cross-compiled NixOS image (`nixos/`), plus bench helper scripts and verified flash
+backups. No tests.
+
+Remaining work is in `PORTING.md` §7: fan *control* (it is pinned, not controlled),
+a `kirkwood-ds410j.dts`, warm reboot, LEDs, and LUKS on the array.
 
 `PORTING.md` is the source of truth for the plan and for progress. `OPERATIONS.md` is the
 bench setup: serial/network topology, the helper scripts in `kernel/`, the gotchas that
-have already cost time, and a **pre-flight checklist that must be read before the first
-flash write**. Work on this project means updating those documents or building artifacts.
+have already cost time, and a **flash checklist that must be read before any flash
+write**. Build commands live in the `.nix` files, which carry their own reasoning.
 
-**Status as of 2026-09-03: M1-M3 complete, and our U-Boot is now IN FLASH.** The
-bootloader is **Marvell U-Boot 1.1.4, not RedBoot** - see `PORTING.md` section 10, which
-corrects several claims below that were wrong. **The first flash write has happened**
-(`PORTING.md` §10.11, §10.14). **mtd1** holds our `IH_TYPE_KERNEL`-wrapped U-Boot
-2026.07 instead of Synology's kernel, **mtd2** holds a 685-byte ramdisk stub instead of
-Synology's `rd.gz` (reclaiming 1.25 MB), and **mtd4** holds a real U-Boot environment.
-The box therefore cold-boots unattended, with nothing attached, to a U-Boot 2026.07
-`=>` prompt in a few seconds.
+**Flash state (`PORTING.md` §2).** The bootloader is **Marvell U-Boot 1.1.4, not
+RedBoot** - the `fis`-named partitions are inherited Synology labels with nothing behind
+them. **mtd1** holds our `IH_TYPE_KERNEL`-wrapped U-Boot 2026.07 instead of Synology's
+kernel, **mtd2** a 685-byte ramdisk stub instead of Synology's `rd.gz` (reclaiming
+1.25 MB), and **mtd4** a real U-Boot environment. The box cold-boots unattended, with
+nothing attached but a USB stick, all the way to a NixOS login.
 
 **mtd0 is untouched**, write protection is restored, and whole-chip crc32 is now
-`605f1a9b` (`8bc4bbb7` was pristine stock; per-partition values in `OPERATIONS.md`).
+`4b513de1` (`8bc4bbb7` was pristine stock; per-partition values in `OPERATIONS.md`).
 `flash-backup/` still describes the stock chip and is still the recovery source. Stock
 DSM no longer boots, which is **fine and intended** - see "What we are protecting".
 
@@ -68,11 +67,11 @@ device with no software recovery path:
   this box.
 - ~~Never run RedBoot's `fis init`~~ — **not applicable**, there is no RedBoot. The
   `fis`-named partitions are inherited Synology labels.
-- Back up all six MTD partitions before any flash write (§7.1). **Already done** and
+- Back up all six MTD partitions before any flash write (§2). **Already done** and
   verified byte-for-byte: `flash-backup/` and `flash-backup-copy2/`, plus a full-chip
   `ds410j-flash-full-4MB.bin` (crc32 `8bc4bbb7`). That is the *stock* image; the device
-  itself now reads `605f1a9b` because mtd1, mtd2 and mtd4 were rewritten (§10.11,
-  §10.14). `OPERATIONS.md` carries the per-partition values.
+  itself now reads `4b513de1` because mtd1, mtd2 and mtd4 were rewritten (§2).
+  `OPERATIONS.md` carries the per-partition values.
 - **The flash is hardware write-protected** (M25P32 block-protect bits; `flinfo` says
   `Write Protection: All`). `sf erase` fails with `ERROR: flash area is locked` until
   `sf protect unlock` runs. Protection is **top-anchored**, so unlocking far enough to
@@ -80,23 +79,23 @@ device with no software recovery path:
 - **mtd2 is load-bearing for our own boot chain** - and *only* for ours now, since DSM
   is expendable. The stock `bootcmd`'s second argument is a real ramdisk argument on
   the `IH_TYPE_KERNEL` path, and Synology's `rd.gz` currently satisfies it. Erasing
-  mtd2 boot-loops the box (§10.8). It may be *replaced* by a minimal valid ramdisk
+  mtd2 boot-loops the box (§4). It may be *replaced* by a minimal valid ramdisk
   uImage - it does not have to stay Synology's - but it must never be merely blank.
 - Serial console (3.3 V TTL, 115200 8N1) must be working before the first flash write.
   It is on **`/dev/ttyUSB0`** here (was `/dev/ttyS1`; the device name changes when the
   host<->VM handover changes) — see `OPERATIONS.md`.
-- **Our U-Boot switches the fans OFF, and Linux does not turn them back on** (§12.2).
+- **Our U-Boot switches the fans OFF, and Linux does not turn them back on** (§5.3).
   The fan is a 3-bit GPIO speed select on GPIO0 15/16/17 where 0 = off; the ds109 MPP
   table leaves those pins low, and `gpio-fan-150-15-18` fails to probe under Linux
-  (§10.3), so nothing recovers it. U-Boot now pins a safe speed in `board_init()`.
+  (§2), so nothing recovers it. U-Boot now pins a safe speed in `board_init()`.
   **Any U-Boot built without that patch must not be left running with drives fitted.**
-  §10.3's old "the fans run from hardware default" is true only for the stock-loader
+  §5.3's old "the fans run from hardware default" is true only for the stock-loader
   path, which is not the path we ship.
 - `bootdelay` is 3 s and **cannot be changed persistently** — the stock loader has no
   `saveenv`, so all `setenv` changes are RAM-only. A power cycle always returns to a
   known-good stock configuration.
 - A modern U-Boot is chainloaded from the stock U-Boot into the freed `zImage` slot; it
-  never replaces the stock loader. Verified working in RAM (`PORTING.md` §10.7).
+  never replaces the stock loader. Verified working in RAM (`PORTING.md` §5.1).
 - **Warm reboot does not work** — neither Linux nor U-Boot 2026.07 can reset this SoC.
   Every reset needs a human to power cycle the box.
 - Never run `nix` **evaluation** on the device — 118 MB will OOM the evaluator. All builds
@@ -106,7 +105,7 @@ device with no software recovery path:
 
 ## Confidence markers
 
-`PORTING.md` tags factual claims `[CONFIRMED]` (verified from the DSM diagnostic dump),
+`PORTING.md` tags factual claims `[CONFIRMED]` (observed on this hardware),
 `[LIKELY]` (strong inference), or `[VERIFY]` (must be checked against the actual kernel/U-Boot
 tree or hardware). Several `[VERIFY]` items are recollections of trees as of ~May 2026 and may
 be stale.
@@ -125,7 +124,7 @@ arbitrary:
 2. **RAM.** 118 MB forces cross-compilation and a minimal closure.
 3. ~~**Hand-written DTS.**~~ **Resolved:** mainline's `kirkwood-ds409.dts` already declares
    `synology,ds410j` and boots this board. A custom DTS is now only wanted for three
-   defects (`PORTING.md` §10.3), not to boot.
+   defects (`PORTING.md` §7.1), not to boot.
 
 Two boot paths are maintained deliberately, for redundancy:
 
@@ -149,7 +148,7 @@ Non-obvious couplings worth holding in mind:
   with "no longer has any effect", because the Rust `switch-to-configuration-ng` is the only
   implementation left. The replacement is **`system.switch.enable = false`**, whose own docs
   describe it as "good for image based appliances where updates are handled outside the
-  image" - exactly this project. See `nixos/configuration.nix` and §11.
+  image" - exactly this project. See `nixos/configuration.nix` and §6.1.
   Watch for Rust re-entering sideways: `nixos-generate-config` references `bcachefs-tools`,
   which is Rust, so the `system.tools.nixos-*` scripts must be disabled too.
 - **There is no hwmon device on this board at all**, so fan control has no kernel-side input;
@@ -161,7 +160,7 @@ Non-obvious couplings worth holding in mind:
 
 ## Milestones
 
-§8 tracks M1–M7 as checkboxes. **M3 is the go/no-go gate**: mainline kernel TFTP'd into RAM,
+The status line at the top of `PORTING.md` tracks where things stand. **M3 is the go/no-go gate**: mainline kernel TFTP'd into RAM,
 reaching a serial shell, all 4 bays enumerating, ethernet up. Everything before M3 is
 reversible. If M3 fails, the instruction is to stop and reassess rather than work around it.
 

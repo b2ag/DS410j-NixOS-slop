@@ -62,7 +62,7 @@ setsid /src/kernel/serlog.sh & disown
    is 3 s. Starting the spammer after `sercmd.sh` returns is already too late, and the
    board autoboots into stock DSM.
 
-4. **Warm reboot does not work** (PORTING.md 10.6). Neither Linux nor U-Boot 2026.07 can
+4. **Warm reboot does not work** (PORTING.md §3.3). Neither Linux nor U-Boot 2026.07 can
    reset this SoC; both hang. **Every reset needs a human to power cycle.** Budget for
    it - you cannot iterate unattended.
 
@@ -76,14 +76,14 @@ setsid /src/kernel/serlog.sh & disown
    U-Boot lives at `0x00600000` with the low 8 MB reserved. Anything over ~5.9 MB loaded
    at `0x00008000` overwrites the running loader mid-copy and wedges the CPU silently.
    Build uImages with `-a 0x02000000 -e 0x02000000` and the position-independent zImage
-   relocates itself. See PORTING.md section 5 phase 1.
+   relocates itself. See PORTING.md §4.
 
 8. **`carrier` tells you whether the DS410j is powered**, which serial cannot: a box
    that is off and a box whose console is wedged both look like silence. Check
    `cat /sys/class/net/eth1/carrier` - `0` means unpowered, `1` means alive. Note the
    DS410j needs **both** outlet power *and* a front-panel button press.
 
-9. **The SPI flash is write-protected in hardware** (PORTING.md 10.10). `sf erase`
+9. **The SPI flash is write-protected in hardware** (PORTING.md §2). `sf erase`
    returns `ERROR: flash area is locked` until `sf protect unlock` runs, and because
    the M25P32's block-protect bits are top-anchored, unlocking far enough to reach the
    `zImage` slot unprotects **mtd0 as well**. Re-lock (`sf protect lock 0 0x400000`)
@@ -100,7 +100,7 @@ tftpboot 0x04000000 uImage-hi
 bootm 0x04000000
 ```
 
-Stock loader -> modern U-Boot -> TFTP -> Linux (the full chain, PORTING.md 10.7):
+Stock loader -> modern U-Boot -> TFTP -> Linux (the full chain, PORTING.md §5.1):
 
 ```
 setenv ipaddr 192.168.50.50; setenv serverip 192.168.50.1; setenv netmask 255.255.255.0
@@ -114,7 +114,7 @@ bootm 0x00800000
 ```
 
 Rehearsal for the unattended-boot hook - stock loader -> `bootm` -> modern U-Boot
-(PORTING.md 10.8). Note the **real flash address** as the second argument: that makes
+(PORTING.md §4). Note the **real flash address** as the second argument: that makes
 this bit-identical to the flashed path except for where argument 1 points.
 
 ```
@@ -132,7 +132,7 @@ pre-10.9 binary, to bisect if the `SKIP_LOWLEVEL_INIT_ONLY` change is implicated
 Verify flash is untouched (from the stock loader):
 
 ```
-crc32 0xf8000000 0x400000     ->  4b513de1 as of §14 (8bc4bbb7 = pristine stock)
+crc32 0xf8000000 0x400000     ->  4b513de1 as of §2 (8bc4bbb7 = pristine stock)
 ```
 
 or from the chainloaded U-Boot 2026.07, which reads the chip over SPI rather than
@@ -177,7 +177,7 @@ of the 8 GB stick is used; the root partition grows to fill the rest on first bo
 
 Nothing on the DS410j needs changing to boot it: the flashed `bootcmd` is already
 `usb start; bootflow scan`, and U-Boot's bootstd searches `/extlinux/extlinux.conf`
-and `/boot/extlinux/extlinux.conf` on every partition (PORTING.md 10.14). Serial
+and `/boot/extlinux/extlinux.conf` on every partition (PORTING.md §2). Serial
 console is `console=ttyS0,115200n8`; root password is `ds410j` for v1.
 
 Reading the image back without mounting it (no loop devices in the container):
@@ -194,15 +194,15 @@ substitutes from `cache.nixos.org`.
 
 # FLASH STATE - read before any further flash write
 
-**The first write has happened (2026-09-03, PORTING.md 10.11).** mtd1 no longer holds
+**The first write has happened (2026-09-03, PORTING.md §2).** mtd1 no longer holds
 Synology's kernel; it holds our `IH_TYPE_KERNEL`-wrapped U-Boot 2026.07, verified
 byte-for-byte. mtd0 and mtd2 are untouched and write protection has been restored.
 
 - Whole-chip `crc32 0xf8000000 0x400000` is now **`4b513de1`**. Per-partition:
   mtd0 `273ca0c6`, mtd1 `5b703dd6`, mtd2 `5fd81497`, mtd3 `cab00674`, mtd4 `06ed043d`,
-  mtd5 `368b19d9`. (`8bc4bbb7` = pristine stock; `00471165` = after the mtd1 write
-  only.) mtd2 now holds a 685-byte ramdisk stub, not Synology's `rd.gz`; mtd4 holds a
-  real U-Boot environment.
+  mtd5 `368b19d9`. (`8bc4bbb7` = pristine stock.) mtd1 holds our U-Boot, mtd2 a
+  685-byte ramdisk stub rather than Synology's `rd.gz`, and mtd4 a real U-Boot
+  environment.
 - `flash-backup/` and `flash-backup-copy2/` still describe the **stock** chip and both
   still verify clean. They remain the recovery source.
 - Stock DSM no longer boots. **Intended** - DSM is expendable; what must survive is the
@@ -216,7 +216,7 @@ The checklist below still governs every future write.
 - [ ] Re-verify the backup is still good: `md5sum -c` against
       `flash-backup/CHECKSUMS.txt`, and confirm `flash-backup-copy2/` matches.
 - [ ] Confirm the on-device flash is where you think it is: `crc32 0xf8000000 0x400000`
-      = `4b513de1` as of §14.
+      = `4b513de1` as of §2.
 - [ ] Confirm the serial console is attached and working. A bricked loader with no UART
       is a paperweight.
 - [ ] **Rehearse the exact payload in RAM first.** TFTP the identical bytes to the
@@ -230,7 +230,7 @@ The checklist below still governs every future write.
 
 ## Open questions to settle BEFORE flashing
 
-1. ~~**`CONFIG_TEXT_BASE` for the flashed image.**~~ **Settled** (PORTING.md 10.8).
+1. ~~**`CONFIG_TEXT_BASE` for the flashed image.**~~ **Settled** (PORTING.md §4).
    TEXT_BASE stays `0x02000000` - the address 10.7 already proved - and the image is
    wrapped as `IH_TYPE_KERNEL` with `-a 0x02000000 -e 0x02000000`, so `bootm` memmoves
    the payload exactly there. `0x02000000` is clear of the running stock loader
@@ -242,7 +242,7 @@ The checklist below still governs every future write.
    `IH_TYPE_KERNEL` path runs `cleanup_before_linux()` (disable interrupts, disable
    I-cache, D-cache and L2, invalidate) before entering the payload, and the payload
    now runs `cpu_init_crit` itself via `CONFIG_SKIP_LOWLEVEL_INIT_ONLY`
-   (PORTING.md 10.9). Still **rehearse with `bootm`, not `go`.**
+   (PORTING.md §5.1). Still **rehearse with `bootm`, not `go`.**
 3. ~~**Writing mtd1 destroys the ability to boot stock DSM.**~~ **Done, and not a
    concern** - DSM is expendable by project decision (CLAUDE.md, "What we are
    protecting"). The thing to protect is the two-stage chain, not the stock OS.
@@ -257,10 +257,10 @@ The checklist below still governs every future write.
 
 | Target | Risk | Recovery if it goes wrong |
 |---|---|---|
-| **mtd4** (env, 0x3D0000) | **lowest** - all zeros today, and the stock loader provably never reads it (PORTING.md 10.13: built with `CFG_ENV_IS_NOWHERE`) | Re-flash 128 KB from backup; stock loader unaffected either way |
+| **mtd4** (env, 0x3D0000) | **lowest** - all zeros today, and the stock loader provably never reads it (PORTING.md §5.4: built with `CFG_ENV_IS_NOWHERE`) | Re-flash 128 KB from backup; stock loader unaffected either way |
 | **mtd1** (our U-Boot, 0x80000) | **low** - stock loader at offset 0 is untouched and still TFTP-boots | Re-flash over TFTP+Linux via the stock loader; the chain's stage 1 is what makes this safe |
 | **mtd2** (ramdisk arg, 0x280000) | **medium** - a *blank* mtd2 boot-loops instead of dropping to a prompt | Interrupt autoboot with `spam.sh` (bootdelay=3 still applies each loop), then TFTP |
 | **mtd0** (bootloader, 0x0) | **HIGH - do not** | External SPI programmer only (desolder). Full-chip image is `ds410j-flash-full-4MB.bin` |
 
-Prefer mtd4, then mtd1. `PORTING.md` section 10.5 has the reasoning; mtd0 is a last
+Prefer mtd4, then mtd1. `PORTING.md` §4 has the reasoning; mtd0 is a last
 resort and the plan should not require it.
