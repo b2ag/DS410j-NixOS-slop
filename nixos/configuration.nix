@@ -61,7 +61,13 @@ let
     (_: lib.mkDefault (lib.kernel.option lib.kernel.module));
 in
 {
-  imports = [ "${modulesPath}/installer/sd-card/sd-image.nix" ];
+  imports = [
+    "${modulesPath}/installer/sd-card/sd-image.nix"
+    ./device-tree.nix   # builds and installs our own kirkwood-ds410j.dtb
+    ./fan-control.nix   # fan + bay LEDs, which the DTB is a prerequisite for
+    ./mcu-panel.nix     # front-panel power/status lamps, via the board MCU
+    ./readonly-root.nix # ro root + tmpfs for everything activation writes
+  ];
 
   #### Cross compilation ######################################################
   # MUST match pkgsCross.armv5tel-multiplatform exactly - that attribute is
@@ -145,6 +151,31 @@ in
       SCSI = yes;
       BLK_DEV_SD = yes;
       EXT4_FS = yes;
+
+      # Fan control. The DS410j fan is a 3-bit GPIO speed select on GPIO0
+      # 15/16/17 and gpio-fan is the driver for exactly that shape of hardware,
+      # but nixpkgs' armv5 defconfig leaves SENSORS_GPIO_FAN unset, so until now
+      # there was no gpio-fan driver at all - a correct device tree on its own
+      # would still have given no fan control. Built in, not a module: the
+      # driver registers a devm action that sets speed 0 (= fan OFF) on removal,
+      # and an rmmod that silently stops the fans on a box with no thermal
+      # sensor is not a failure mode worth having.
+      SENSORS_GPIO_FAN = yes;
+
+      # The only temperature source on this board. There is no hwmon device of
+      # any kind here (PORTING.md 3.3); drivetemp reads each SATA drive's own
+      # sensor over SCT/SMART and presents it as hwmon, which is what
+      # ds410j-fan-control.sh steers by. The alternative was smartmontools in
+      # userspace - a C++ cross build in a closure with no binary cache.
+      SENSORS_DRIVETEMP = yes;
+
+      # Bay LEDs. LEDS_GPIO is already on via nixpkgs' common config, but the
+      # triggers are worth having explicitly: panic is genuinely useful on a
+      # headless box, and disk-activity is the zero-cost way to get activity
+      # blink (global across all libata devices, so all four bays blink
+      # together - per-bay activity needs userspace, see fan-control.nix).
+      LEDS_TRIGGER_PANIC = yes;
+      LEDS_TRIGGER_DISK = yes;
     }) // lib.optionalAttrs useScopedDriverModules scopedDriverModules;
     }
     // lib.optionalAttrs useScopedDriverModules { autoModules = false; }
@@ -177,18 +208,11 @@ in
   ];
   boot.consoleLogLevel = 7;
 
-  # Mainline has no kirkwood-ds410j.dts, but kirkwood-ds409.dts already declares
-  # synology,ds410j and boots this board - confirmed at M3, the kernel reports
-  # "Machine model: Synology DS409, DS410j" (PORTING.md 10.3).
-  hardware.deviceTree.enable = true;
-  # NOT "marvell/kirkwood-ds409.dtb". The kernel source has it under
-  # arch/arm/boot/dts/marvell/, but the dtb directory NixOS ships in /boot is
-  # FLAT - verified by reading the built image with debugfs: 225 .dtb files, no
-  # subdirectories, kirkwood-ds409.dtb at the top level. The vendor prefix is
-  # silently accepted here and only shows up as U-Boot failing to load the FDT
-  # at boot, so it is worth re-checking against a built image after any kernel
-  # version bump.
-  hardware.deviceTree.name = "kirkwood-ds409.dtb";
+  # Device tree: see ./device-tree.nix. Bring-up used mainline's
+  # kirkwood-ds409.dts, which declares "synology,ds410j" and does boot this
+  # board, but it describes a DS409 - swapped LED colours, a fifth bay, a
+  # gpio-fan node that cannot probe, and eth1 and the native SATA controller
+  # both enabled and fighting over MPP21. We now build kirkwood-ds410j.dtb.
 
   #### Bootloader #############################################################
   boot.loader.grub.enable = false;
@@ -305,6 +329,18 @@ in
   # sees a hostile network.
   users.users.root.initialPassword = "ds410j";
 
+  # BENCH KEY - not yours. This is the key the assistant used to drive the box
+  # over ssh while bringing up the fan and LEDs; it is here so that a reflash
+  # stops wiping it, since /root is about to become a tmpfs and nothing written
+  # there by hand will survive a boot at all.
+  #
+  # The lib.warn fires on every evaluation so this cannot be forgotten quietly.
+  users.users.root.openssh.authorizedKeys.keys = [
+    (lib.warn
+      "ds410j: the bench ssh key in configuration.nix is still enabled - replace it with your own"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEQtO6ReMMo6RZX5tpLvZnSfy3FmBXn0+Y1xTPb4TIGq claude@bench")
+  ];
+
   # 118 MB of RAM (CLAUDE.md). zram buys real headroom for a box this small.
   zramSwap.enable = true;
   zramSwap.memoryPercent = 50;
@@ -317,6 +353,15 @@ in
   sdImage = {
     # dd-able as-is; no zstd step for the user to undo.
     compressImage = false;
+
+    # No growing the root partition on first boot. This is an appliance image:
+    # the closure is fixed at build time, `system.switch.enable = false` means it
+    # is never rebuilt in place, and leaving the partition at its built size
+    # keeps the on-disk layout identical to what was tested. It also leaves the
+    # rest of the stick unallocated, which is where a writable /var partition
+    # would go if we want persistent logs alongside a read-only root (§7.3).
+    expandOnBoot = false;
+
     # Nothing goes in the firmware partition: our bootloader lives in SPI flash,
     # not on the stick. sd-image always creates the partition, so leave it at the
     # default size (mkfs.vfat -F 32 needs room) and just leave it empty.
@@ -325,6 +370,25 @@ in
       mkdir -p ./files/boot
       ${config.boot.loader.generic-extlinux-compatible.populateCmd} \
         -c ${config.system.build.toplevel} -d ./files/boot
+
+      # Mount points must EXIST in the image, because the root filesystem is
+      # mounted read-only (./readonly-root.nix) and stage 1 cannot mkdir them.
+      #
+      # This is not theoretical - it is the bug that stranded the first
+      # read-only boot:
+      #   mounting tmpfs on /bin...
+      #   mkdir: can't create directory '/mnt-root/bin': Read-only file system
+      #   mount: /mnt-root/bin: mount point does not exist.
+      # On a writable root, activation creates these at first boot and nobody
+      # notices they were missing from the image.
+      #
+      # Every tmpfs mount point in readonly-root.nix needs an entry here. If you
+      # add a mount there, add the directory here too.
+      mkdir -p ./files/{etc,var,home,srv,bin,usr,lib}
+      mkdir -p ./files/{proc,sys,dev,run,mnt}
+      mkdir -p ./files/boot/firmware
+      mkdir -p -m 0700 ./files/root
+      mkdir -p -m 1777 ./files/tmp
     '';
   };
 }

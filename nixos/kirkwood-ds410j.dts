@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Synology DS410j (Marvell Kirkwood 88F6281)
+ *
+ * Mainline has no DS410j board file. kirkwood-ds409.dts declares
+ * "synology,ds410j" in its compatible list and does boot this board, but it
+ * describes a DS409, and three of the differences are not cosmetic. Everything
+ * asserted here was measured on the hardware - see PORTING.md 7.1.
+ *
+ * 1. The bay LEDs have their colours swapped, and there are four bays, not five.
+ *    Walking every LED in kirkwood-synology.dtsi's gpio-leds-hdd-36 node with
+ *    two drives fitted, in bays 2 and 4, gave:
+ *
+ *      DT name            physical lamp        DT name            physical lamp
+ *      green:hdd1   ->    amber, bay 1         amber:hdd1   ->    (nothing)
+ *      green:hdd2   ->    amber, bay 2         amber:hdd2   ->    green, bay 2
+ *      green:hdd3   ->    amber, bay 3         amber:hdd3   ->    (nothing)
+ *      green:hdd4   ->    amber, bay 4         amber:hdd4   ->    green, bay 4
+ *
+ *    Behaviour of the two pins of a bay, all four combinations [CONFIRMED]:
+ *
+ *      even pin (36/38/40/42) high, odd low   ->  AMBER, always
+ *      odd  pin (37/39/41/43) high, even low  ->  GREEN, but only if a drive
+ *                                                 is fitted; empty bay stays dark
+ *      both high                              ->  DARK
+ *      both low                               ->  DARK
+ *
+ *    So they are NOT two independent lamps - two independent LEDs both driven
+ *    would light, not go dark. It behaves as one bi-colour LED wired
+ *    anti-parallel, with the green direction's return path additionally routed
+ *    through the drive connector [LIKELY mechanism]: current one way is amber,
+ *    the other way is green, equal levels put no potential across it, and with
+ *    no drive the green path is simply open.
+ *
+ *    Two consequences for anything driving these pins. First, never set both:
+ *    there is no DT binding that can express the constraint, so gpio-leds cannot
+ *    enforce it and nixos/ds410j-fan-control.sh keeps them mutually exclusive by
+ *    hand. Second, amber is the only colour available for an EMPTY bay, which is
+ *    what makes "expected drive missing" expressible at all.
+ *
+ *    GPIO 44/45 (mainline's hdd5 pair) were tested and light nothing - this
+ *    chassis has four bays.
+ *
+ * 2. gpio-fan-150-15-18 cannot probe as written. It carries
+ *    alarm-gpios = <&gpio0 18>, and gpio_fan_get_of_data() requests that with
+ *    GPIOD_IN, but pmx_fanalarm_18 muxes MPP18 as "gpo" and MPP18 on the
+ *    88F6281 has no "gpio" function at all - only "gpo" (pinctrl-kirkwood.c,
+ *    MPP_MODE(18)). mvebu_gpio_set_direction() therefore returns -ENOTSUPP
+ *    (-524) and the whole probe fails, taking fan control with it. The alarm
+ *    line is unreadable on this SoC, so the property has to go rather than be
+ *    corrected. The failure happens before fan_ctrl_init(), which is why the
+ *    fan keeps whatever speed the bootloader left rather than stopping.
+ *
+ * 3. kirkwood-synology.dtsi enables the SoC's own sata@80000 with nr-ports = <2>
+ *    and ds409.dts enables eth1. Both are wrong here: the four bays are behind a
+ *    PCIe 88SX7042, the SoC ports are unpopulated, and ethphy1 (MDIO addr 9) is
+ *    absent. They also collide - pmx_sata0 and pmx_ge1 both want MPP21 - which
+ *    is the "pin PIN21 already requested by f1076000.ethernet-controller"
+ *    message on every boot.
+ *
+ *
+ * 5. THE BUTTONS ARE NOT VISIBLE, AND IT IS OUR OWN BOOTLOADER'S DOING.
+ *    DSM shuts this box down cleanly on a short press of the power button
+ *    [CONFIRMED by the owner, twice]. Under our stack nothing sees it: no
+ *    change on any of 39 readable GPIO lines, nothing from the microcontroller
+ *    (rx stays 0 for both power and reset), and no power-off on a 10 s hold.
+ *
+ *    The reason is that we chainload a U-Boot built from ds109_defconfig, and
+ *    the DS109 MPP table sets MPP12_GPO, MPP20_SATA1_ACTn, MPP21_SATA0_ACTn.
+ *    GPO is output-only, so a button on MPP12 cannot be read at all, and
+ *    reading its GPIO returns the output register rather than the pad - which
+ *    is exactly why a press produced no change and the search looked conclusive
+ *    when it was not. DSM never has this problem: stock loader, own board file.
+ *
+ *    Of the pins our boot chain renders unreadable, only three can be inputs on
+ *    an 88F6281 at all (pinctrl-kirkwood.c): MPP12, MPP20 and MPP21 - 5, 7 and
+ *    19 are "gpo" on every variant and so can never be a button. The gpio-keys
+ *    node below claims those three to force them back to gpio. It is a
+ *    diagnostic: whichever one reports a press is the button, and it then
+ *    becomes a single KEY_POWER entry and the others are deleted.
+ *
+ * Not fixed here, and not fixable here: the alarm/status and power lamps.
+ * kirkwood-synology.dtsi's gpio-leds-alarm-12 node is spurious on this model -
+ * neither the GPIO its pinctrl selects (MPP12) nor the one its gpios property
+ * names (GPIO 21) lights anything, and DSM's ds410j_synobios.ko implements
+ * SetAlarmLed, SetPowerLedStatus, SetHDDActLed and SetPhyLed as bare
+ * "mov r0,#0; bx lr" stubs. So the node is disabled.
+ *
+ * That does NOT mean those lamps are uncontrollable - only that they are not on
+ * a GPIO and so cannot be described by gpio-leds. They are driven by the
+ * board's microcontroller over UART1 (serial@12100, 9600 8N1), the same MCU
+ * mainline already pokes for power-off. DSM's own
+ * /usr/syno/share/synogrinst/grinst-common.sh documents the status-LED codes:
+ *
+ *      static  blink
+ *      green      8      9
+ *      orange     :      ;      anything else = off, DSM uses 7
+ *
+ * (and qnap-poweroff.c contributes '1' = power off). Driving that belongs in a
+ * driver or in userspace, not in this file - see PORTING.md 7.1.
+ */
+
+/dts-v1/;
+
+#include "kirkwood.dtsi"
+#include "kirkwood-6281.dtsi"
+#include "kirkwood-synology.dtsi"
+
+/ {
+	model = "Synology DS410j";
+	compatible = "synology,ds410j", "marvell,kirkwood";
+
+	memory {
+		device_type = "memory";
+		reg = <0x00000000 0x8000000>;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200n8";
+		stdout-path = &uart0;
+	};
+
+	gpio-fan-150-15-18 {
+		status = "okay";
+
+		/* See note 2. Keep pmx_fanalarm_18 in pinctrl-0 so MPP18 still
+		 * lands in a defined state; only the unusable input goes. */
+		/delete-property/ alarm-gpios;
+
+		/* Lets a future thermal zone bind the fan as a cooling device.
+		 * Inert today - this board has no temperature sensor the
+		 * thermal framework can consume (PORTING.md 3.3). */
+		#cooling-cells = <2>;
+	};
+
+	/* Replaces gpio-leds-hdd-36, which stays disabled. Same GPIOs, colours
+	 * the right way round, and no fifth bay. Deliberately carries no
+	 * linux,default-trigger: a device tree describes hardware, and which
+	 * trigger each lamp runs is policy, set from NixOS. */
+	gpio-leds-ds410j-hdd {
+		compatible = "gpio-leds";
+		pinctrl-0 = <&pmx_hddled_36 &pmx_hddled_37 &pmx_hddled_38
+			     &pmx_hddled_39 &pmx_hddled_40 &pmx_hddled_41
+			     &pmx_hddled_42 &pmx_hddled_43>;
+		pinctrl-names = "default";
+
+		led-hdd1-amber {
+			label = "synology:amber:hdd1";
+			gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd1-green {
+			label = "synology:green:hdd1";
+			gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd2-amber {
+			label = "synology:amber:hdd2";
+			gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd2-green {
+			label = "synology:green:hdd2";
+			gpios = <&gpio1 7 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd3-amber {
+			label = "synology:amber:hdd3";
+			gpios = <&gpio1 8 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd3-green {
+			label = "synology:green:hdd3";
+			gpios = <&gpio1 9 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd4-amber {
+			label = "synology:amber:hdd4";
+			gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
+		};
+
+		led-hdd4-green {
+			label = "synology:green:hdd4";
+			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/* DIAGNOSTIC, round 2. See note 5 in the header.
+	 *
+	 * Round 1 (MPP12/20/21) came back negative, and the search that had
+	 * "cleared" everything else turned out to be broken: gpioinfo reports
+	 * nearly every line as an OUTPUT, so gpioget was reading the output latch
+	 * rather than the pad. The only lines it ever read honestly were the three
+	 * that gpio-keys had already claimed and set to input.
+	 *
+	 * So this claims every remaining pin that could actually be a button, which
+	 * forces each to gpio and to input. Keycodes are 600 + the GPIO number, so
+	 * a press names its own pin and no code collides with anything meaningful
+	 * (KEY_MAX is 767). Deliberately NOT KEY_POWER: logind would shut the box
+	 * down on a spurious event from a pin that is really an output.
+	 *
+	 * Excluded, and the exclusions matter more than the inclusions:
+	 *   29 30 31 34 44 45  DRIVE POWER ENABLES (pmx_hdd*_pwr_* in
+	 *                      kirkwood-synology.dtsi). Flipping these to input
+	 *                      could cut power to fitted disks.
+	 *   5 7 18 19 33       "gpo" on every 88F6281 variant - output-only, so
+	 *                      they can never be a button. 33 in particular would
+	 *                      have failed the pinctrl apply and taken the whole
+	 *                      node down with it.
+	 *   12 20 21           round 1, conclusively negative.
+	 *   0-3 8-11 13 14     SPI, i2c, uart0, uart1.
+	 *   15-17 36-43        fan and bay LEDs, in use.
+	 */
+	gpio-keys-candidates {
+		compatible = "gpio-keys";
+		pinctrl-0 = <&pmx_ds410j_buttons>;
+		pinctrl-names = "default";
+
+		key-gpio4 {
+			label = "ds410j candidate gpio4";
+			linux,code = <604>;
+			gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio22 {
+			label = "ds410j candidate gpio22";
+			linux,code = <622>;
+			gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio23 {
+			label = "ds410j candidate gpio23";
+			linux,code = <623>;
+			gpios = <&gpio0 23 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio24 {
+			label = "ds410j candidate gpio24";
+			linux,code = <624>;
+			gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio25 {
+			label = "ds410j candidate gpio25";
+			linux,code = <625>;
+			gpios = <&gpio0 25 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio26 {
+			label = "ds410j candidate gpio26";
+			linux,code = <626>;
+			gpios = <&gpio0 26 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio27 {
+			label = "ds410j candidate gpio27";
+			linux,code = <627>;
+			gpios = <&gpio0 27 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio28 {
+			label = "ds410j candidate gpio28";
+			linux,code = <628>;
+			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio32 {
+			label = "ds410j candidate gpio32";
+			linux,code = <632>;
+			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio35 {
+			label = "ds410j candidate gpio35";
+			linux,code = <635>;
+			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio46 {
+			label = "ds410j candidate gpio46";
+			linux,code = <646>;
+			gpios = <&gpio1 14 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio47 {
+			label = "ds410j candidate gpio47";
+			linux,code = <647>;
+			gpios = <&gpio1 15 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio48 {
+			label = "ds410j candidate gpio48";
+			linux,code = <648>;
+			gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+
+		key-gpio49 {
+			label = "ds410j candidate gpio49";
+			linux,code = <649>;
+			gpios = <&gpio1 17 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
+		};
+	};
+};
+
+/* See note 1. */
+&{/gpio-leds-hdd-36} {
+	status = "disabled";
+};
+
+/* See note 5. Our U-Boot is ds109_defconfig, whose MPP table sets MPP12_GPO
+ * (output only), MPP20_SATA1_ACTn and MPP21_SATA0_ACTn. Kirkwood has one pinmux
+ * block - MPP_CTRL0..6 at 0xF1010000, 4 bits per pin - and Linux only rewrites
+ * the fields it has a consumer for, so pins nothing claims keep whatever the
+ * bootloader left. Claiming them here is what puts them back to gpio; no U-Boot
+ * change is needed.
+ *
+ * MPP20/21 are free to take because this board's SATA is the PCIe 88SX7042 and
+ * both &sata and &eth1 are disabled above - they were the two nodes that used to
+ * fight over MPP21.
+ */
+&pinctrl {
+	pmx_ds410j_buttons: pmx-ds410j-buttons {
+		marvell,pins = "mpp4", "mpp22", "mpp23", "mpp24", "mpp25",
+				"mpp26", "mpp27", "mpp28", "mpp32", "mpp35",
+				"mpp46", "mpp47", "mpp48", "mpp49";
+		marvell,function = "gpio";
+	};
+};
+
+
+/* See note 3. Unpopulated on this chassis, and pmx_sata0 claims MPP21, which
+ * pmx_ge1 also wants. */
+&sata {
+	status = "disabled";
+};
+
+/* See note 3. ethphy1 is absent; the wired port is eth0. Left explicit because
+ * ds409.dts enables it and this is the deliberate difference. Without this the
+ * device sits in deferred probe forever - mv643xx_eth_port.1 in
+ * /sys/kernel/debug/devices_deferred. */
+&eth1 {
+	status = "disabled";
+};
+
+/* Ricoh RS5C372A on i2c@11000, keeps time across power cycles. */
+&rs5c372 {
+	status = "okay";
+};
+
+/*
+ * Board temperature sensor - an LM75-compatible part at I2C 0x48, sharing the
+ * bus with the RTC.
+ *
+ * This board was believed to have no temperature sensor at all for the whole
+ * project; PORTING.md said so in two places and it drove real decisions (it is
+ * why fan control reads drive temperatures via CONFIG_SENSORS_DRIVETEMP, and why
+ * 3.3 claimed the kernel thermal framework was unusable here because there was
+ * "nothing for a thermal zone to read"). That was wrong.
+ *
+ * Found by reading DSM: ds410j_synobios.ko's GetSysTemperature is implemented,
+ * not stubbed, and does
+ *      mov r0, #0x48 ; mov r2, #2 ; bl mvI2CCharRead
+ * then byte-swaps and shifts right by 7 - the textbook LM75 conversion. 0x48 is
+ * the canonical LM75 address. i2cdetect confirmed a device there, and binding
+ * the driver produced a live reading.
+ *
+ * Why lm75b rather than lm75 or lm75a: those are 9-bit in the Linux driver
+ * (0.5 C), lm75b is 11-bit (0.125 C). A 9-bit part can only ever set bit 7 of
+ * the LSB, but a forced raw read of register 0 returned lsb=0xa0 - bit 5 set,
+ * i.e. 0.5 + 0.125. Typed as "lm75" it reported 47500; typed as "lm75b",
+ * 47750. So the extra resolution is real and 9-bit typing silently truncates it.
+ * (DSM truncates too - its >>7 keeps only 9 bits.)
+ *
+ * The exact part number is [VERIFY] - it needs the markings on the chip. What is
+ * established is that it is LM75-register-compatible with at least 11-bit
+ * resolution, which is what the compatible string has to get right.
+ *
+ * #thermal-sensor-cells is what lets a thermal zone bind this as a sensor; the
+ * lm75 driver passes HWMON_C_REGISTER_TZ, so the hwmon core registers it. Paired
+ * with the #cooling-cells = <2> on gpio-fan above, in-kernel thermal control of
+ * the fan is now possible - which 3.3 said it could never be.
+ */
+&i2c0 {
+	temperature-sensor@48 {
+		compatible = "national,lm75b";
+		reg = <0x48>;
+		#thermal-sensor-cells = <0>;
+	};
+};
+
+/*
+ * eth0's MAC is deliberately NOT set here. The stock loader's vendor partition
+ * (mtd3) holds 00:11:32:02:f9:a6 and our U-Boot passes it in via the ethernet0
+ * alias, which is both correct for any DS410j and the only version of this that
+ * could go upstream. Verified: eth0 comes up with the vendor MAC, not the
+ * 00:00:5f:ff:00:00 fallback.
+ */

@@ -11,10 +11,45 @@ armv5tel, 118 MB usable RAM, **Marvell U-Boot 1.1.4** bootloader, 4 MB SPI NOR f
 serial login and ssh, `systemctl is-system-running` reports `running` with zero failed
 units. There are nix builds for the kernel (`kernel/`), U-Boot (`uboot/`) and the
 cross-compiled NixOS image (`nixos/`), plus bench helper scripts and verified flash
-backups. No tests.
+backups. The only tests are `nixos/test-fan-control.sh` (40 assertions against a
+fake sysfs).
 
-Remaining work is in `PORTING.md` §7: fan *control* (it is pinned, not controlled),
-a `kirkwood-ds410j.dts`, warm reboot, LEDs, and LUKS on the array.
+Fan control, the bay LEDs and the front panel **work and are boot-tested on the
+hardware** (2026-09-03; evidence in `PORTING.md` §0). Remaining work is in
+`PORTING.md` §7: warm reboot, per-bay activity LEDs, and LUKS.
+
+**Bay LED pins are one bi-colour LED per bay, not two lamps.** Even pin = amber
+(always), odd pin = green (only with a drive fitted), **both high = dark**.
+`gpio-leds` cannot express that constraint, so anything writing those pins must
+keep them mutually exclusive - `nixos/ds410j-fan-control.sh` does, with a
+regression test. Amber is the only colour an empty bay can show.
+
+
+**Two things are parked mid-investigation** and are listed at the top of
+`PORTING.md` under "Unfinished, and easy to forget": the **kwboot / BootROM
+recovery test** (inconclusive; retest raw, and ideally with the serial adapter on
+a real host rather than through USB passthrough) and **what set
+power-on-at-AC-restore** (cause entirely unknown - the MCU is one guess among
+several, not a finding). Read that list before starting anything new.
+
+**The box can now be power-cycled remotely** - `kernel/ds410j-power.sh cycle`,
+verified end to end. "Every reset needs a human at the button" is no longer true,
+and that was a load-bearing constraint on how this project iterates. Two caveats
+that matter: the 433 MHz radio reaches **every outlet in the house** (the address
+is hardcoded, never parameterise it), and why AC-restore power-on started is
+still unknown (§3.3), so `off` is the dangerous direction - `cycle` always ends
+by trying to switch ON. It does not help with flashing the USB stick, so a bad
+image still strands the box.
+
+**The board MCU is a mapped command channel** (`/dev/ttyS1`, 9600 8N1, single ASCII
+characters). `0x31`-`0x3B` is fully mapped: `1` power off, `2`/`3` beep, `4`/`5`/`6`
+power LED steady/blink/off, `7`-`;` status LED. It owns the status and power lamps
+and the buzzer - which is why those are *not* GPIOs and cannot be `gpio-leds` - and
+it is a live lead on warm reboot, since `poweroff` already works by sending it `1`.
+`nixos/ds410j-mcu.sh` is the only writer in the system and takes an allowlist, so
+no service can power the box off by getting a character wrong. Full table in
+`OPERATIONS.md`, "The board microcontroller on /dev/ttyS1". **Never send it an
+unidentified character unattended:** every reset needs a human at the button.
 
 `PORTING.md` is the source of truth for the plan and for progress. `OPERATIONS.md` is the
 bench setup: serial/network topology, the helper scripts in `kernel/`, the gotchas that
@@ -84,20 +119,28 @@ device with no software recovery path:
 - Serial console (3.3 V TTL, 115200 8N1) must be working before the first flash write.
   It is on **`/dev/ttyUSB0`** here (was `/dev/ttyS1`; the device name changes when the
   host<->VM handover changes) — see `OPERATIONS.md`.
-- **Our U-Boot switches the fans OFF, and Linux does not turn them back on** (§5.3).
-  The fan is a 3-bit GPIO speed select on GPIO0 15/16/17 where 0 = off; the ds109 MPP
-  table leaves those pins low, and `gpio-fan-150-15-18` fails to probe under Linux
-  (§2), so nothing recovers it. U-Boot now pins a safe speed in `board_init()`.
+- **Our U-Boot switches the fans OFF unless patched** (§5.3). The fan is a 3-bit GPIO
+  speed select on GPIO0 15/16/17 where 0 = off; the ds109 MPP table leaves those pins
+  as **inputs**, which the fan reads as 0. U-Boot pins a safe speed in `board_init()`.
   **Any U-Boot built without that patch must not be left running with drives fitted.**
   §5.3's old "the fans run from hardware default" is true only for the stock-loader
   path, which is not the path we ship.
+  Linux *can* now recover it, which it previously could not: both
+  `CONFIG_SENSORS_GPIO_FAN` (absent from nixpkgs' armv5 defconfig, so there was no
+  gpio-fan driver at all) and the `alarm-gpios` property that made the DT node fail to
+  probe with -524 are fixed. That does **not** retire the U-Boot patch — it only
+  shortens the window in which the fans are off, from "forever" to "until Linux
+  starts".
 - `bootdelay` is 3 s and **cannot be changed persistently** — the stock loader has no
   `saveenv`, so all `setenv` changes are RAM-only. A power cycle always returns to a
   known-good stock configuration.
 - A modern U-Boot is chainloaded from the stock U-Boot into the freed `zImage` slot; it
   never replaces the stock loader. Verified working in RAM (`PORTING.md` §5.1).
 - **Warm reboot does not work** — neither Linux nor U-Boot 2026.07 can reset this SoC.
-  Every reset needs a human to power cycle the box.
+  A power cycle is still required, but the box **powers itself on when AC is
+  restored**, and a remote outlet is now wired and verified
+  (`kernel/ds410j-power.sh`). What enabled that behaviour is unknown (§3.3) - do
+  not assume it survives a different MCU poke.
 - Never run `nix` **evaluation** on the device — 118 MB will OOM the evaluator. All builds
   cross-compile on x86_64 via **`pkgsCross.armv5tel-multiplatform`** (`pkgsCross.sheevaplug`
   no longer exists in nixpkgs; the current name resolves to the same
@@ -122,9 +165,13 @@ arbitrary:
 1. **Flash budget.** 2 MB kernel slot (3.25 MB after re-carving FIS), 1.25 MB initrd slot.
    A NixOS stage-1 initrd is 15–40 MB, so it cannot live in flash — hence `/boot` on USB.
 2. **RAM.** 118 MB forces cross-compilation and a minimal closure.
-3. ~~**Hand-written DTS.**~~ **Resolved:** mainline's `kirkwood-ds409.dts` already declares
-   `synology,ds410j` and boots this board. A custom DTS is now only wanted for three
-   defects (`PORTING.md` §7.1), not to boot.
+3. ~~**Hand-written DTS.**~~ **Resolved, then written anyway:** mainline's
+   `kirkwood-ds409.dts` declares `synology,ds410j` and does boot this board, which is
+   what unblocked bring-up. It describes a DS409 though, so `nixos/kirkwood-ds410j.dts`
+   now exists for four measured defects (`PORTING.md` §7.1) — swapped bay LED colours,
+   a fifth bay, a gpio-fan node that cannot probe, and eth1/native-SATA fighting over
+   MPP21. It is compiled standalone by `nixos/device-tree.nix`, *not* added to the
+   kernel tree, so editing it costs seconds rather than a full cross build.
 
 Two boot paths are maintained deliberately, for redundancy:
 
@@ -151,9 +198,12 @@ Non-obvious couplings worth holding in mind:
   image" - exactly this project. See `nixos/configuration.nix` and §6.1.
   Watch for Rust re-entering sideways: `nixos-generate-config` references `bcachefs-tools`,
   which is Rust, so the `system.tools.nixos-*` scripts must be disabled too.
-- **There is no hwmon device on this board at all**, so fan control has no kernel-side input;
-  it needs a userspace daemon polling drive SMART temps. For v1 the fan is pinned at a safe
-  speed. Fan and poweroff are correctness issues on a 4-bay box, not polish.
+- **There IS a board temperature sensor** - an LM75-compatible part at I2C 0x48, found
+  by reading DSM (PORTING.md §3.3). It was believed absent for most of the project,
+  which is why fan control is built on `CONFIG_SENSORS_DRIVETEMP` (per-drive temps)
+  rather than on the board sensor or an in-kernel thermal zone. Both are now possible:
+  the sensor has `#thermal-sensor-cells` and gpio-fan has `#cooling-cells`. Fan and
+  poweroff are correctness issues on a 4-bay box, not polish.
 - The `boot.initrd.enable = false` path uses `init=/nix/var/nix/profiles/system/init` — a
   store-independent path, which is what lets a cmdline baked into flash survive generation
   switches.

@@ -31,6 +31,15 @@ Worth knowing before interpreting anything, and easy to get wrong from a log alo
   address is **not** the `192.168.50.50` that U-Boot uses.
 - Root password on the serial console is `ds410j` - a v1 placeholder, see
   `nixos/configuration.nix`.
+- **ssh from this container** works and is much faster than the serial console for
+  anything non-boot. A key was installed via serial into `/root/.ssh/authorized_keys`:
+  ```sh
+  ssh -i ~/.ssh/ds410j root@192.168.50.138
+  ```
+  The address is the DHCP lease, not the `192.168.50.50` U-Boot uses; check it with
+  `ip neigh show dev eth1` and look for the vendor MAC `00:11:32:02:f9:a6`. The key
+  is bench convenience only — it is not in `configuration.nix`, so a reflash of the
+  USB stick loses it and it has to be re-added over serial.
 
 ## Helper scripts (`/src/kernel/`)
 
@@ -41,6 +50,10 @@ Worth knowing before interpreting anything, and easy to get wrong from a log alo
 | `spam.sh [secs]` | Spam spaces at the console to interrupt autoboot (`bootdelay=3`). |
 | `dump-flash.sh` | Dump all six MTD partitions over ethernet and verify against device md5. |
 | `init.sh` | The initramfs init baked into the bring-up kernel. |
+| `install-bench.sh` | Cross-build libgpiod and push it plus `ds410j-bench.sh` to the box. |
+| `ds410j-bench.sh` | **Runs on the DS410j, not here.** Drive the fan, LEDs and MCU by hand; `led bay N` shows the anti-parallel wiring. |
+| `kwboot-test.sh` | Probe the SoC BootROM UART recovery path. Writes nothing. |
+| `ds410j-power.sh` | Remote mains switch via the 433 MHz outlet. `cycle` is the safe verb. |
 
 Typical session start:
 
@@ -48,6 +61,295 @@ Typical session start:
 stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb -crtscts -ixon -ixoff raw -echo
 setsid /src/kernel/serlog.sh & disown
 ```
+
+
+## Driving the fan and LEDs by hand
+
+`kernel/ds410j-bench.sh` is the odd one out in that directory: it runs **on the
+DS410j**. Deploy it, together with a cross-built libgpiod, with:
+
+```sh
+/src/kernel/install-bench.sh          # DS=192.168.50.138 KEY=~/.ssh/ds410j to override
+```
+
+Then from a root shell on the box:
+
+```sh
+/root/ds410j-bench.sh fan get         # current 3-bit speed select, decoded
+/root/ds410j-bench.sh fan step        # interactive: type 0-7, waits for you at each
+/root/ds410j-bench.sh led walk        # lights each LED in turn, waits for you at each
+/root/ds410j-bench.sh led set synology:green:hdd2 1
+```
+
+It talks to the GPIO character device directly rather than through `gpio-fan`,
+which is the whole point: it has to work on a kernel where
+`CONFIG_SENSORS_GPIO_FAN` is unset, and that was exactly the kernel that made the
+tool necessary. `fan step` prints the pins read back after every change, so it
+cannot claim a speed it failed to select.
+
+Two things about libgpiod worth knowing before you trust a reading:
+
+- **`gpioget` defaults to forcing the line to input.** On the fan pins that
+  would drop the speed select. Always pass `--as-is`; the bench script does.
+- **`gpioset` holds the lines until it exits, then warns the state is "not
+  guaranteed".** On mvebu it is in practice: released pins keep both their
+  direction and value (verified — set `0 0 0`, let `gpioset` exit, read back
+  `0 0 0`). That is why `fan set` can use a one-second `timeout` and still latch.
+
+Everything the box needs at runtime is in the system closure; libgpiod lives in
+`/root/gpiod` and is deliberately *not* part of it.
+
+
+### Verifying fan and LED control after a reboot
+
+The board needs a human to power cycle it, so it is worth getting everything out
+of one boot. In order:
+
+```sh
+# 1. the right device tree loaded
+cat /proc/device-tree/model                 # -> "Synology DS410j", not "DS409, DS410j"
+
+# 2. the MPP21 collision is gone, and eth1 is no longer deferred
+dmesg | grep -i "already requested"         # -> nothing
+cat /sys/kernel/debug/devices_deferred      # -> no mv643xx_eth_port.1
+
+# 3. gpio-fan probed and is bound to a driver
+ls /sys/bus/platform/drivers/gpio-fan/      # -> gpio-fan-150-15-18 symlink
+grep -l gpio_fan /sys/class/hwmon/*/name    # -> the fan's hwmon
+dmesg | grep -i "GPIO fan"                  # -> "GPIO fan initialized"
+
+# 4. drive temperatures are readable
+for h in /sys/block/sd*/device/hwmon/hwmon*/temp1_input; do
+  echo "$h $(cat $h)"; done                 # -> milli-C per SATA drive
+
+# 5. the daemon is running and has picked a speed
+systemctl status ds410j-fan-control
+journalctl -u ds410j-fan-control            # -> "max drive temp NNC ... -> NNNN rpm"
+
+# 6. front panel, via the MCU
+systemctl status ds410j-panel               # -> active (exited)
+#    blue power LED should now be STEADY, not blinking - that is the
+#    ds410j-panel unit having sent '4' once multi-user.target was reached.
+#    Status LED should be green.
+
+# 7. LED colours are now the right way round
+/root/ds410j-bench.sh led set synology:amber:hdd2 1   # -> AMBER lamp, bay 2
+/root/ds410j-bench.sh led set synology:green:hdd2 1   # -> GREEN lamp, bay 2
+/root/ds410j-bench.sh led all 0
+
+# 8. nothing regressed
+systemctl is-system-running                 # -> running
+systemctl --failed
+```
+
+**Bay LED wiring.** The two pins of a bay drive one bi-colour LED, not two lamps:
+
+| even pin (36/38/40/42) | odd pin (37/39/41/43) | result |
+|---|---|---|
+| high | low | **amber**, with or without a drive |
+| low | high | **green**, only with a drive fitted |
+| high | high | **dark** |
+| low | low | dark |
+
+So an empty bay can show amber but never green, and setting both pins is the
+same as setting neither. `ds410j-bench.sh led bay N` walks all four combinations,
+waiting at each. Stop `ds410j-fan-control` first or it re-asserts them every 30 s.
+
+Expect `/sys/class/leds` to hold **eight** entries after this, not eleven: the
+`hdd5` pair and `synology:alarm` are gone. That is not because those lamps do not
+exist — the status lamp very much does — but because they are not GPIOs and so
+cannot be `gpio-leds`. They live on the MCU instead; see "The board
+microcontroller on /dev/ttyS1" above, and PORTING.md §7.1.
+
+**GPIO 44/45 (mainline's `green:hdd5` / `amber:hdd5`) are still untested.** On a
+4-bay chassis those two pins are unaccounted for, so before trusting the eight-LED
+figure it is worth checking them on a kernel that still declares them — i.e.
+*before* reflashing, not after:
+
+```sh
+/root/ds410j-bench.sh led set synology:green:hdd5 1     # anything?
+/root/ds410j-bench.sh led set synology:amber:hdd5 1
+/root/ds410j-bench.sh led all 0
+```
+
+A caution on step 3: if `gpio-fan` fails to probe, the fan keeps whatever U-Boot
+set (3300 rpm) rather than stopping - the failure happens before the driver
+touches the pins. So a broken probe is safe but silent; check for it rather than
+assuming the fan is under control because the box is not on fire.
+
+
+
+## Remote power control
+
+The DS410j is on a 433 MHz mains outlet driven by a host-side transmitter. The
+guest reaches it through a second QEMU serial port, `/dev/ttyS1` at 9600 8N1, on
+which the host listens for whole lines.
+
+```sh
+/src/kernel/ds410j-power.sh status
+/src/kernel/ds410j-power.sh cycle      # off, 10s, on - verified
+/src/kernel/ds410j-power.sh on
+```
+
+**Only `cycle` and `on` are ever safe to walk away from.** This works at all
+because the box powers itself on when AC returns (§3.3); that behaviour is not
+understood, so `cycle` always ends by trying to switch ON and shouts loudly if it
+cannot. Leaving the box off is the one outcome that needs a human.
+
+Three properties worth knowing before touching it:
+
+1. **The radio reaches every outlet in the owner's home.** The address
+   `m-FS300 1337 a` is hardcoded in the script and there is deliberately no
+   option to override it. A mistyped address does not error - it switches
+   something else in someone's house.
+2. **The link is one-way.** `/dev/ttyS1` sends nothing back, and the transmitter
+   is hand-built and does not work every time. So *nothing* is inferred from the
+   write succeeding; every action is verified against
+   `/sys/class/net/eth1/carrier` and retried up to three times. Carrier is the
+   honest indicator of whether the box has power (gotcha 8).
+3. **Commands need a trailing newline.** The host reads whole lines; without
+   `\n` the command sits in the buffer and nothing happens.
+
+Measured on the first verified cycle: carrier dropped 2 s after `off`, and came
+back 4 s after `on`, with the box at a login prompt about 90 s later. The 45 s
+on-timeout in the script has plenty of margin.
+
+This does **not** help with flashing the USB stick, so a bad image still strands
+the box until someone reflashes it.
+
+## The board microcontroller on /dev/ttyS1
+
+The DS410j has an MCU on **UART1** (`serial@12100`, mmio `0xF1012100`), exposed by
+our kernel as **`/dev/ttyS1`**, **9600 8N1**. It owns the front-panel status and
+power lamps and the power rail. Commands are **single ASCII characters** written
+to the tty. This is the same MCU mainline's `qnap-poweroff.c` uses.
+
+```sh
+stty -F /dev/ttyS1 9600 cs8 -cstopb -parenb raw -echo
+printf ';' > /dev/ttyS1        # status LED: orange, blinking
+```
+
+| Code | Hex | Effect | Source |
+|---|---|---|---|
+| `1` | `0x31` | **POWER OFF** | mainline `qnap-poweroff.c` |
+| `2` | `0x32` | buzzer, short beep | measured on this board |
+| `3` | `0x33` | buzzer, long beep | measured on this board |
+| `4` | `0x34` | power LED (blue) steady | measured on this board |
+| `5` | `0x35` | power LED (blue) blinking | measured on this board |
+| `6` | `0x36` | power LED (blue) off | measured on this board |
+| `7` | `0x37` | status LED off | `grinst-common.sh` |
+| `8` | `0x38` | status LED green, static | `grinst-common.sh` |
+| `9` | `0x39` | status LED green, blinking | `grinst-common.sh` |
+| `:` | `0x3a` | status LED orange, static | `grinst-common.sh` |
+| `;` | `0x3b` | status LED orange, blinking | `grinst-common.sh` |
+| `t` | `0x74` | unidentified, DSM shutdown path | `syno_poweroff_task` |
+
+`0x31`–`0x3B` is a **complete contiguous block** [CONFIRMED]: power, buzzer, power
+LED, status LED, in that order. `4`/`5` explain the front panel's normal
+behaviour — DSM sends `4` when boot finishes and `5` during shutdown, which is
+why a running-but-not-DSM box sits there blinking.
+
+Symbols and letters outside this block are unmapped. `k`/`l` are wake-on-LAN
+(`libsynosdk.so.5`), not MCU LED codes. If a reset command exists it is most
+likely a letter — `q w e r ...` — since the protocol otherwise uses plain
+printable characters; `t` already being in DSM's shutdown path is suggestive.
+
+**Never send an unidentified character unattended.** `1` powers the box off
+immediately, and every reset needs a human at the front-panel button
+(PORTING.md §3.3), so a stray byte costs a trip to the bench. `t` appears in
+DSM's shutdown path and is unidentified — leave it alone. Mapping the rest is
+worth doing and there is tooling for it below; the rule is that a human watches
+the chassis and the byte is logged before it is sent.
+
+Where these came from, for anyone re-deriving them: DSM's system partition is
+`/dev/sdc1`, a RAID1 member with **0.90 metadata**, which puts the superblock at
+the *end* and so leaves the ext4 filesystem at offset 0. `mount` refuses it by
+autodetection, but an explicit type works, and `noload` keeps it genuinely
+read-only by skipping journal replay:
+
+```sh
+mount -t ext4 -o ro,noload /dev/sdc1 /mnt/dsm
+grep -rn ttyS1 /mnt/dsm/usr/syno /mnt/dsm/lib
+```
+
+### Mapping it
+
+`ds410j-bench.sh` has an `mcu` subcommand for this. It refuses `1` and `t`
+without `--force`, and it **writes each character to the log before sending it,
+then syncs** — so if a code kills the box, the log still names the culprit.
+
+```sh
+/root/ds410j-bench.sh mcu known          # confirm the documented codes, waits at each
+/root/ds410j-bench.sh mcu send 8         # one character
+/root/ds410j-bench.sh mcu probe 0x3c 0x40   # step a range, recording what you see
+/root/ds410j-bench.sh mcu map            # print /root/mcu-map.txt
+```
+
+`mcu probe` demands a literal `YES` before it starts, then walks the range one
+character at a time and prompts for an observation after each, appending it
+immediately. Work in small ranges rather than one long sweep: the log survives a
+power-off, but your place in the range does not.
+
+Where to look first. The status codes occupy a contiguous block at `0x37`–`0x3B`
+(`7 8 9 : ;`), so a second lamp is plausibly in an adjacent block — `0x3C`–`0x40`
+(`< = > ? @`) or `0x32`–`0x36` (`2`–`6`). Two things are known to be missing and
+worth wanting:
+
+- **the power LED codes.** DSM makes the blue lamp steady when boot completes and
+  blink during shutdown, so a "system ready" code exists.
+- **a reset command.** The MCU already cuts power for `1`, so pulsing it is
+  plausible in the same silicon, and it would close PORTING.md §3.3 — currently
+  every reset needs a human at the button.
+
+### Is there a watchdog in there?
+
+Unresolved, and worth keeping an open mind about. What is established: **nothing
+is armed by default** — the box ran 2 h 48 min with `tx:0` on this port and did
+not reset. What is *not* established is whether one can be armed by a command we
+have not identified. Note the MCU never transmits (`rx:0` even with the port held
+open and after commands), but that is not evidence either way: a watchdog needs a
+timer and a way to act, not a way to talk, and this MCU demonstrably has the
+acting part.
+
+
+## Is the board actually brickable? (kwboot)
+
+**Open question, testable, and it would change §0 if it holds.** The safety model
+says mtd0 is "the only recovery path short of a SOIC clip". That may be false.
+
+The 88F6281 has a mask-ROM BootROM which, per `kwboot(1)`, "polls the UART for a
+brief period of time" on every power-up, looking for a handshake that starts an
+xmodem image upload. U-Boot's `kwboot` speaks it and names Kirkwood explicitly,
+citing the 88F6281 functional spec chapter 24.2. If it answers on this board,
+then the SoC has a recovery path that **no flash write can damage**, and the
+worst case drops from "desolder the SPI chip" to "plug in the serial cable".
+
+```sh
+# board must be OFF; kwboot has to be listening before the BootROM polls
+/src/kernel/kwboot-test.sh handshake     # then power on
+/src/kernel/kwboot-test.sh debug         # BootROM's own console; ? for help
+```
+
+The script stops the serial logger first (gotcha 1 - two readers split the
+bytes and the handshake silently never matches) and restarts it on exit.
+
+**This writes nothing.** It sends the handshake and uploads no image, so the
+worst case is the BootROM waiting for a transfer that never arrives, cured by a
+power cycle. It cannot touch flash.
+
+What the outcomes mean:
+
+- `Handshake with bootrom established` — the recovery path is real. mtd0 stops
+  being irreplaceable. It would still be the *cheaper* recovery, so "never
+  `bubt`" stays good practice, but the catastrophic-risk tier disappears and
+  experiments that were off the table become merely inconvenient.
+- The normal `U-Boot 1.1.4` banner scrolls past — the BootROM did not answer.
+  Worth retrying: the polling window is short and the handshake has to overlap
+  it. Only after several attempts is a negative meaningful.
+
+Caveat worth stating: even a working kwboot only helps if a serial console is
+attached, which on this bench it always is - but it is not a recovery path for
+a box in a cupboard.
 
 ## Gotchas that have cost real time
 
@@ -104,6 +406,24 @@ setsid /src/kernel/serlog.sh & disown
    `zImage` slot unprotects **mtd0 as well**. Re-lock (`sf protect lock 0 0x400000`)
    as soon as the write is verified. The stock loader has always advertised this:
    `flinfo` -> `Write Protection: All`.
+
+**`grep` the serial log with `-a`.** `logs/serial.log` contains raw console
+bytes, so grep classifies it as binary and prints *nothing* rather than the
+matching lines — it does not error, it just silently finds nothing. This has
+already caused two wrong conclusions in this project ("the mirror is not
+working", when it was). Always:
+
+```sh
+grep -a MCU-SEND /src/kernel/logs/serial.log | tr -d '\r'
+```
+
+Every character sent to the MCU by `ds410j-bench.sh mcu send` is mirrored to the
+serial console and so ends up here, prefixed `MCU-SEND`. That matters because the
+on-box log (`/root/mcu-map.txt`) is on a **tmpfs** and dies at every reboot — it
+is what lost the record of whatever was sent around the time the box started
+powering on at AC restore (PORTING.md §3.3). The host-side serial log is the only
+persistent record this bench has.
+
 
 ## Known-good sequences
 
@@ -232,7 +552,7 @@ after every build, because the store path is awkward to reach from the host.
 
 ```sh
 IMG=/src/nixos/out/ds410j-nixos.img
-sha256sum "$IMG"          # ce08268dba8dd4e74eb91d078f616807ebaa58bc1733dc16faec0042b98ddc18
+sha256sum "$IMG"          # 3d82eda184355922c3ebc808cdeac95bc054b7235e35194e7ae1536572b76d6f
 sudo dd if="$IMG" of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 

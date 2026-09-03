@@ -7,6 +7,31 @@ Mainline Linux + NixOS on a Synology DS410j: Marvell Kirkwood 88F6281, armv5tel,
 6.12.104, with a serial login and ssh, and nothing attached but a USB stick.
 `systemctl is-system-running` reports `running`, zero failed units.
 
+**Fan control and the front panel work (2026-09-03)** [CONFIRMED on hardware].
+`nixos/kirkwood-ds410j.dts` replaces mainline's `ds409.dts`; the kernel gains
+`SENSORS_GPIO_FAN` (absent from nixpkgs' armv5 defconfig, so there had been no
+gpio-fan driver at all) and `SENSORS_DRIVETEMP`. Evidence from the first boot of
+the new image:
+
+```
+Machine model: Synology DS410j            <- our DTS, not ds409
+gpio-fan gpio-fan-150-15-18: GPIO fan initialized
+hwmon0: gpio_fan   hwmon1: drivetemp   hwmon2: drivetemp
+ds410j-fan: max drive temp 34C over 2/2 drive(s) -> 2200 rpm
+ds410j-fan: max drive temp 35C over 2/2 drive(s) -> 2500 rpm
+```
+
+`dmesg | grep "already requested"` is empty (the MPP21 collision is gone) and
+`devices_deferred` no longer lists `mv643xx_eth_port.1`. `/sys/class/leds` holds
+8 entries, not 11. `systemctl is-system-running` reports `running`, zero failed
+units. The bay-detection code was incidentally proven against a changed
+configuration: with both drives moved to bays 1 and 3 it reported `sdb -> bay 1`,
+`sdc -> bay 3` and skipped the USB stick.
+
+`nixos/mcu-panel.nix` drives the front-panel power and status lamps through the
+board MCU, so the power lamp now goes steady at boot instead of blinking forever.
+`nixos/out/ds410j-nixos.img` is the deployable image.
+
 ```
 stock Marvell U-Boot 1.1.4 (mtd0, never written)
   -> our U-Boot 2026.07 (mtd1)      bootm F8080000 F8280000
@@ -27,6 +52,29 @@ checklist. Build commands live in `kernel/`, `uboot/` and `nixos/` — read the
 Preserve this convention. Never silently promote a `[VERIFY]`; promote it only
 after checking, and say what you checked against.
 
+
+## Unfinished, and easy to forget
+
+Two things are parked mid-investigation. Both are written up in full further
+down; this list exists so they are not lost.
+
+1. **kwboot / BootROM recovery — INCONCLUSIVE, retest wanted.** (§7.3,
+   `OPERATIONS.md` "Is the board actually brickable?") One attempt was made and
+   settled nothing: the stock U-Boot did not come up, and no prompt could be got
+   afterwards with `tio` either, so it is unclear whether the BootROM answered,
+   whether the wrapper interfered, or whether the serial path was simply wedged.
+   Not yet tried: **without** `kernel/kwboot-test.sh`, i.e. raw
+   `kwboot -b -t /dev/ttyUSB0`; and from a host with the USB serial adapter
+   attached directly rather than passed through into this container, since QEMU
+   USB passthrough is a plausible source of timing trouble for a protocol with a
+   short handshake window. Worth answering because it re-grades §0.
+
+2. **What set power-on-at-AC-restore — UNKNOWN.** (§3.3) The behaviour changed and
+   the change is real; the cause is not known and the MCU is only one guess among
+   several. It is useful and we would not want to undo it by accident, but we can
+   neither reproduce it deliberately nor reverse it.
+
+Everything else outstanding is in §7.
 ---
 
 ## 0. Rules that must not be broken
@@ -66,8 +114,12 @@ All [CONFIRMED] on this board.
 | USB | 2 x USB 2.0 `ehci-orion`, behind an internal Genesys GL850G 4-port hub (`05e3:0608`) |
 | RTC | Ricoh `rs5c372a`, keeps time across power cycles |
 | Crypto | CESA present |
-| hwmon | **none at all** — there is no temperature sensor on this board |
-| Fan | 3-bit GPIO speed select on GPIO0 **15/16/17**, `0` = off; alarm on 18 |
+| hwmon | **LM75-compatible sensor at I2C 0x48** (11-bit, 0.125 C), plus per-drive `drivetemp`. Long believed absent - see §3.3 |
+| Fan | 3-bit GPIO speed select on GPIO0 **15/16/17**; alarm on 18 is `gpo`-only, so unreadable (§5.3) |
+| Bay LEDs | GPIO **36/38/40/42** = amber 1-4, **37/39/41/43** = green 1-4. One bi-colour LED per bay, the two pins anti-parallel: **both high = dark**. Green is gated on drive presence. Mainline has the colours swapped (§7.1) |
+| Status + power LEDs | **not GPIOs** — driven by the board MCU over UART1 (`/dev/ttyS1`, 9600 8N1). LAN is PHY-driven (§7.1) |
+| MCU | on UART1 `serial@12100`, 9600 8N1 = `/dev/ttyS1`. Single-ASCII commands, `0x31`-`0x3B` fully mapped: `1` power off, `2`/`3` beep, `4`/`5`/`6` power LED steady/blink/off, `7`-`;` status LED (§7.1) |
+| Buzzer | on the MCU: `2` short beep, `3` long beep. No GPIO involved |
 | MAC | `00:11:32:02:f9:a6` (from mtd3, the vendor partition) |
 
 The SATA controller being behind PCIe is the most commonly-forgotten fact here:
@@ -154,11 +206,82 @@ dnstap removes it (`uboot`-style patches live in `nixos/configuration.nix`).
 Expect more of these. The pattern is not "this cannot work" but "this path is so
 rarely taken that it is broken".
 
-### 3.3 No hwmon, no working SoC reset
+### 3.3 The board sensor we missed, and no working SoC reset
 
-There is no temperature sensor anywhere on this board, so fan control has no
-kernel-side input and needs a userspace daemon polling drive SMART temps (§7.1).
+**There IS a temperature sensor on this board** [CONFIRMED]: an LM75-compatible
+part at I2C **0x48**, on the same bus as the RTC. This section previously said
+"there is no temperature sensor anywhere on this board", and the hardware table
+said `hwmon: none at all`. Both were wrong for the entire project, and the error
+was load-bearing: it is why fan control was built on `CONFIG_SENSORS_DRIVETEMP`
+reading drive temperatures, and why this section claimed the kernel thermal
+framework was unusable here because there was "nothing for a thermal zone to
+read". That reasoning is void.
 
+It was found by reading DSM rather than the hardware. `ds410j_synobios.ko`'s
+`GetSysTemperature` is *implemented*, unlike the LED setters, and does:
+
+```
+mov r0, #0x48 ; mov r2, #2 ; bl mvI2CCharRead   ; then byte-swap and >>7
+```
+
+which is the textbook LM75 conversion at the canonical LM75 address. `i2cdetect`
+confirmed a device at 0x48; instantiating the driver gave a live reading. On the
+bench it reads ~47.7 C with the drives at 42 and 39 C - the board is the hottest
+of the three, which is what a fan is actually there to fix.
+
+`national,lm75b`, not `lm75`: the first two are 9-bit (0.5 C) in the Linux
+driver, `lm75b` is 11-bit (0.125 C). A 9-bit part can only set bit 7 of the LSB;
+a forced raw read of register 0 returned `lsb=0xa0`, bit 5 set. Typed as `lm75`
+it reported 47500, as `lm75b` 47750. The exact part number is [VERIFY] - that
+needs the markings - but LM75-register-compatible at >= 11 bits is established,
+which is what the compatible string has to get right.
+
+Now declared in `nixos/kirkwood-ds410j.dts` with `#thermal-sensor-cells = <0>`.
+The `gpio-fan` node already carries `#cooling-cells = <2>`, so a device-tree
+thermal zone binding the two is now possible - see §7.1.
+
+
+**THE BOX NOW POWERS ON BY ITSELF WHEN AC RETURNS** (2026-09-03). It previously
+needed a front-panel button press after every power cut; it no longer does.
+
+**Reproducible on demand** [CONFIRMED]: a deliberate remote cycle via
+`kernel/ds410j-power.sh` switched the outlet off (carrier 1 -> 0 in 2 s), waited
+10 s, switched it back on (carrier 0 -> 1 in 4 s), and the box booted to a login
+prompt with nobody touching it. **The cause, however, is still completely
+unknown** [VERIFY].
+
+Do not assume the MCU did it. Unmapped characters had been sent to the MCU around
+that time and `q`/`w` were floated as a guess, but that is a guess and nothing
+more — the bench log lived in `/root/mcu-map.txt`, which is a tmpfs on this image,
+so the record was erased at the next reboot. Other explanations are equally open
+and none has been ruled out:
+
+- it may always have behaved this way under some conditions, and the earlier
+  "needs a button press" attempts differed in a way nobody recorded;
+- the remote socket may switch AC differently from pulling the plug;
+- something in our own boot chain or in the stock U-Boot environment (mtd4);
+- an MCU character, known or unknown;
+- the kwboot attempts, which drove the UART during power-up.
+
+What *is* established is only that the behaviour changed. Reproducing it
+deliberately, or reversing it, is unsolved.
+
+One thing follows, and it is worth having regardless of the cause.
+
+**It makes remote power cycling possible, which changes the operating model.**
+"Warm reboot does not work, so every reset needs a human at the button" has
+constrained this project throughout — it is why iteration is slow and why a bad
+image strands the box. With power-on-at-AC-restore, a remote-controlled mains
+socket is a complete remote power cycle. That is a better answer than either
+outstanding warm-reboot lead (an MCU reset character, or RTC auto-power-on), and
+it is wired and working - see `OPERATIONS.md`, "Remote power control". Since we
+still cannot explain why it started, `ds410j-power.sh` treats "off" as the
+dangerous direction: `cycle` always ends by trying to switch ON.
+
+Note what this does NOT establish. It is tempting to conclude the state lives in
+the MCU and therefore that the MCU holds non-volatile settings — but that only
+follows if an MCU character caused it, which is exactly what is unknown. Where
+this setting lives is as open as what set it.
 **Warm reboot does not work.** `systemctl reboot` completes the entire shutdown —
 unmounts, swaps off, SCSI caches flushed — and then hangs at
 `reboot: Restarting system`. Neither Linux nor U-Boot 2026.07 can reset this SoC;
@@ -166,6 +289,40 @@ the *stock* loader can, so the hardware path exists and mainline does not reach 
 Practical consequence: power-cycling after `Restarting system` is **safe**, but
 every reset needs a human. **`poweroff` does work** [CONFIRMED] — the asymmetry is
 that the QNAP power-reset path cuts power but cannot restart.
+
+**There is now a concrete lead.** `poweroff` works because `qnap-poweroff.c`
+writes the single character `1` to the board MCU on UART1. That MCU turns out to
+be a general command channel — it also drives the front-panel status LED (§7.1) —
+so the question is simply which character asks it to reset. DSM's shutdown path
+sends an unidentified `t`, which is the first thing to understand.
+
+The codes are contiguous ASCII, so nearby characters are likely to mean
+something. Mapping them is worth doing, but *supervised*: one character at a
+time, with someone watching the chassis and the sent byte logged before it goes
+out, which is what `ds410j-bench.sh mcu probe` does. An unattended sweep is not -
+`1` powers the box off, and every reset needs a human at the button.
+
+- **Warm reboot: two live leads, neither tried yet.**
+  1. **RTC auto-power-on.** `ds410j_synobios.ko` carries a whole
+     `rtc_ricoh_set_auto_poweron` / `rtc_ricoh_rotate_auto_poweron` family, which
+     is DSM's scheduled-power-on feature — so the RS5C372A's alarm output is
+     wired to this board's power circuit [LIKELY]. `poweroff` already works. So
+     `rtcwake -m no -s 60` followed by `poweroff` would be a self-service reboot
+     built entirely from proven mechanisms, with no unidentified MCU bytes.
+     `rtcwake` is already in the closure. Caveat: `rtc-rs5c372` registers via the
+     deprecated `devm_rtc_device_register()` and no IRQ is wired, so
+     `/sys/class/rtc/rtc0/wakealarm` does **not** exist — but `set_alarm` is in
+     its `rtc_class_ops` and `/proc/driver/rtc` does show `alrm_time`, so the
+     `RTC_WKALM_SET` ioctl should still reach the chip [VERIFY].
+  2. **An MCU reset command.** The MCU cuts power for `1`, so pulsing it is
+     plausible in the same silicon. Needs the character map (§7.1, and
+     `OPERATIONS.md` "The board microcontroller on /dev/ttyS1").
+
+  A watchdog in the MCU would serve the same end and cannot be ruled out.
+  Established: nothing is armed by default — 2 h 48 min of uptime with `tx:0` and
+  no reset. Not established: whether one can be *armed*. The MCU never transmits
+  (`rx:0`), but that is not evidence against: a watchdog needs a timer and a way
+  to act, not a way to talk, and this one already cuts power.
 
 ### 3.4 No binary cache for target packages
 
@@ -274,20 +431,53 @@ Three dead ends, recorded so nobody repeats them:
 Our U-Boot switched the fans **off**, and Linux never turned them back on.
 
 The ds109 MPP table reconfigures MPP15/16/17 as GPIO — the DS109's own fan is on
-32-35, a different DTS node — and leaves them low, which is speed `0` = off.
-`kirkwood-ds409.dts` sets `gpio-fan-150-15-18` to `status = "okay"`, but the driver
-fails to probe (`setup of GPIO alarm failed: -524`), so the pins keep whatever
-U-Boot left. This was invisible during early bring-up because that kernel was
-booted straight from the *stock* loader, which leaves the fans running.
+32-35, a different DTS node — and leaves them **as inputs**, which the fan reads
+as speed `0` = off. Note this is a statement about pin *direction*, not value.
+Whether driving all three low as **outputs** also stops the fan is [VERIFY]: the
+pins provably reach `0 0 0` that way [CONFIRMED], but nobody was listening to the
+chassis at the time, so the fan's response is unmeasured — see §7.1.
 
-`board_init()` now pins a safe speed (3 = 3300 rpm; `DS410J_FAN_SPEED`). Data is
+`kirkwood-ds409.dts` sets `gpio-fan-150-15-18` to `status = "okay"`, but the node
+cannot probe, so the pins keep whatever U-Boot left. This was invisible during
+early bring-up because that kernel was booted straight from the *stock* loader,
+which leaves the fans running.
+
+The probe failure is `-524` = `-ENOTSUPP`, and the mechanism is worth recording
+because the obvious reading of it is wrong [CONFIRMED, read from the 6.12.104
+source]. It is **not** `setup of GPIO alarm failed` — that string is from a
+pre-2016 `gpio-fan.c` and appears nowhere in 6.12. The real path is:
+
+- the node carries `alarm-gpios = <&gpio0 18>`;
+- `gpio_fan_get_of_data()` requests it with `devm_gpiod_get_optional(dev,
+  "alarm", GPIOD_IN)` — an **input**;
+- `pmx_fanalarm_18` muxes MPP18 as `"gpo"`, and MPP18 on the 88F6281 has no
+  `"gpio"` function at all, only `"gpo"` (`pinctrl-kirkwood.c`, `MPP_MODE(18)`);
+- `mvebu_gpio_set_direction()` finds the setting has `MVEBU_SETTING_GPO` but not
+  `GPI` and returns `-ENOTSUPP` (`pinctrl-mvebu.c`).
+
+So the alarm line is **unreadable on this SoC** and the property has to be
+deleted rather than corrected. Two useful consequences: the failure happens in
+`gpio_fan_get_of_data()`, *before* `fan_ctrl_init()` registers the
+`gpio_fan_stop` devm action, which is why a failed probe leaves the fan spinning
+rather than stopping it; and `fan_ctrl_init()` itself sets each pin to
+`gpiod_direction_output(gpio, gpiod_get_value(gpio))`, deliberately preserving
+the bootloader's speed, so a successful probe does not disturb the fan either.
+
+**A correct device tree was never sufficient on its own.** nixpkgs' armv5
+defconfig leaves `CONFIG_SENSORS_GPIO_FAN` unset, so the running NixOS kernel had
+no `gpio-fan` driver at all — the platform device existed with nothing bound to
+it. Both halves are now fixed: `nixos/configuration.nix` sets
+`SENSORS_GPIO_FAN = yes` (built in, not a module — the devm action means an
+`rmmod` would stop the fans) and `nixos/kirkwood-ds410j.dts` deletes
+`alarm-gpios`.
+
+`board_init()` pins a safe speed (3 = 3300 rpm; `DS410J_FAN_SPEED`). Data is
 written before the output enable so the pins never glitch through 0. The encoding
 is not monotonic — 4 is 3000 rpm, *below* 3's 3300.
 
 The `kw_gpio_*` helpers are declared in `mach/gpio.h` but **have no implementation
 anywhere in U-Boot 2026.07**, so the registers are driven directly. On Kirkwood a
 **0** bit in `GPIO_IO_CONF` *enables* the output.
-
 ### 5.4 extlinux support
 
 `ds109_defconfig` predates distro boot. `kernel_addr_r`, `fdt_addr_r`,
@@ -382,48 +572,234 @@ silently supplying. Expect a fourth.
 
 ### 6.4 Device tree
 
-No custom DTS is needed to boot: `kirkwood-ds409.dts` already declares
-`synology,ds410j` and the kernel reports `Machine model: Synology DS409, DS410j`.
+No custom DTS was needed to *boot*: `kirkwood-ds409.dts` declares
+`synology,ds410j` and the kernel reported `Machine model: Synology DS409,
+DS410j`. That is what unblocked bring-up, and it stays the fallback.
 
-**`hardware.deviceTree.name = "kirkwood-ds409.dtb"` — no `marvell/` prefix.** The
-kernel source keeps it under `arch/arm/boot/dts/marvell/`, but the directory NixOS
-ships in `/boot` is **flat**. Nothing catches a wrong name at build time; it
-surfaces only as U-Boot failing to load the FDT. Re-check against a built image
-after any kernel bump.
+We now ship our own anyway — `nixos/kirkwood-ds410j.dts`, for four measured
+defects (§7.1). It is compiled **standalone** by `nixos/device-tree.nix` rather
+than added to the kernel tree, because the kernel is a from-source cross build
+with no binary cache (§3.4): in-tree would mean a full rebuild per DTS edit, this
+way it is seconds. `hardware.deviceTree.dtbSource` points at that one-file
+derivation, so `/boot` carries a single 28 KB `.dtb` instead of mainline's 225,
+which also took about 8 MB off the image.
 
-A custom `kirkwood-ds410j.dts` is still wanted for three defects (§7.1).
-
+**Watch the name, and the lack of a `marvell/` prefix.** The kernel source keeps
+board files under `arch/arm/boot/dts/marvell/`, but the directory NixOS ships in
+`/boot` is **flat**. Nothing catches a wrong `hardware.deviceTree.name` at build
+time; it surfaces only as U-Boot failing to load the FDT. Verify against a built
+image after any kernel bump — `debugfs -R "cat /boot/extlinux/extlinux.conf"` on
+partition 2 shows the `FDT` line (`OPERATIONS.md`).
 ---
 
 ## 7. Open work
 
 ### 7.1 Board integration
 
-- **Fan control.** Currently *pinned*, not controlled: U-Boot holds 3300 rpm and
-  nothing varies it with temperature. Needs (a) `gpio-fan-150-15-18` to probe —
-  it fails at `setup of GPIO alarm failed: -524`, so dropping `alarm-gpios` in a
-  custom DTS is the obvious first try [VERIFY] — and (b) a userspace daemon
-  polling drive SMART temps, since there is no hwmon (§3.3). On a 4-bay box with
-  3 TB drives this is a correctness issue, not polish.
-- **A `kirkwood-ds410j.dts`**, for three defects `ds409.dts` has on this board:
-  1. `kirkwood-synology.dtsi` enables the SoC's native `sata@80000` with
-     `nr-ports = <2>`, claiming MPP20, which `eth1` also wants — `pin PIN20 already
-     requested by f1080000.sata`. Those ports are unpopulated here. Disabling the
-     node frees the pin. Related: `ds409.dts` enables `&eth1`, but `ethphy1` is
-     absent on this board and the wired port is `eth0`, so that looks simply wrong.
-  2. `local-mac-address` — without it `eth0` comes up as `00:00:5f:ff:00:00`.
-  3. the `gpio-fan` probe failure above.
-  Cosmetic: the SPI flash node says `st,m25p80` for an M25P32; `jedec,spi-nor`
-  probes it anyway.
+- **A `kirkwood-ds410j.dts`.** **Done** — `nixos/kirkwood-ds410j.dts`, built
+  standalone by `nixos/device-tree.nix` (not added to the kernel tree, so a DTS
+  edit is seconds rather than a full cross build). `/boot` now carries one 28 KB
+  `.dtb` instead of mainline's 225. It fixes four things `ds409.dts` gets wrong
+  here, all [CONFIRMED] on the hardware:
+  1. **Bay LED colours are swapped, and there is no fifth bay.** Walking every
+     LED with drives in bays 2 and 4 gave `green:hddN` → the *amber* lamp for all
+     four bays, and `amber:hddN` → the *green* lamp for bays 2 and 4 only. The
+     "nothing" cases are exactly the empty bays, so the green lamp is gated on
+     drive presence in hardware while amber is driven unconditionally. Even GPIO
+     (36/38/40/42) = amber, odd (37/39/41/43) = green. GPIO 44/45 are a bay this
+     chassis does not have.
+  2. **`gpio-fan-150-15-18` cannot probe.** `alarm-gpios` is requested as an
+     input on MPP18, which the 88F6281 offers only as `gpo` → `-ENOTSUPP`. Full
+     mechanism in §5.3. The property is deleted; it cannot be corrected.
+  3. **`sata@80000` and `eth1` both enabled and colliding.** `pmx_sata0` and
+     `pmx_ge1` both want **MPP21** — the boot message is `pin PIN21 already
+     requested by f1076000.ethernet-controller`, i.e. eth1 wins and the SoC SATA
+     loses. (Recorded here as PIN20 until 2026-09-03; it is 21.) Neither belongs
+     on this board: the four bays are behind the PCIe 88SX7042 and `ethphy1`
+     (MDIO addr 9) is absent. Both are now `disabled`, which also clears
+     `mv643xx_eth_port.1` out of `/sys/kernel/debug/devices_deferred`.
+  4. `local-mac-address` is **not** set, deliberately. Our U-Boot passes the
+     vendor MAC from mtd3 in via the `ethernet0` alias and `eth0` comes up as
+     `00:11:32:02:f9:a6`, not the `00:00:5f:ff:00:00` fallback [CONFIRMED]. A
+     hardcoded MAC would be wrong for every other DS410j and unupstreamable.
+
+  Cosmetic, not fixed: the SPI flash node says `st,m25p80` for an M25P32;
+  `jedec,spi-nor` probes it anyway.
+
+- **Fan control.** **Working on hardware.** It needed two independent fixes, and
+  the device tree was only one of them: nixpkgs' armv5 defconfig leaves
+  **`CONFIG_SENSORS_GPIO_FAN` unset**, so the running kernel had no `gpio-fan`
+  driver at all and a perfect DTS would still have given no control.
+  `configuration.nix` now sets it (built in, not a module — see §5.3) along with
+  **`CONFIG_SENSORS_DRIVETEMP`**, which turns each SATA drive's own sensor into
+  an ordinary hwmon device and so removes the need for SMART tooling in a closure
+  with no binary cache. `nixos/ds410j-fan-control.sh` closes the loop: hottest
+  drive temperature → `fan1_target`. It never selects speed 0 and never parks the
+  fan on exit; if a drive is present but yields no temperature it goes to full
+  speed. `nixos/test-fan-control.sh` exercises all of it against a fake sysfs on
+  the build host — 40 assertions, because the board needs a human to power cycle
+  it (§3.3) and is a poor place to iterate.
+
+- **Fan policy: quiet baseline, escalate on heat.** The first implementation
+  tracked temperature continuously across six steps. That was wrong for this
+  box: it re-evaluated every 30 s, so the fan was making constant small changes
+  that are more audible than one steady speed, while saving nothing worth
+  hearing at idle temperatures. It now holds a baseline and only reacts to real
+  heat, with everything tunable in `services.ds410jFan`:
+
+  | option | default | meaning |
+  |---|---|---|
+  | `baselineRpm` | `2200` | held until an input passes its threshold; a **floor**, never undercut |
+  | `boardEscalateAboveC` | `55` | board sensor temperature at which ramping starts |
+  | `boardWarnC` | `70` | board temperature that turns the status lamp orange |
+  | `driveEscalateAboveC` | `50` | hottest drive temperature at which ramping starts |
+  | `stepEveryC` | `3` | one speed step per this many degrees above that |
+  | `hysteresisC` | `3` | return to baseline only this far below the threshold |
+  | `driveWarnC` | `55` | amber bay LED and orange status lamp |
+  | `pollSeconds` | `30` | |
+
+  The baseline defaults to the **quietest** speed, not to the 3300 rpm U-Boot
+  pins. That figure is an arbitrary safe-speed pick from bring-up
+  (`uboot/default.nix`, `DS410J_FAN_SPEED`) and sits 4th of 7 on the speed map -
+  it is not a hardware default, and anchoring to it would only inherit a guess.
+  Drives idle around 35 °C and are rated to 55-60 °C, so there is ample headroom.
+
+- **The board sensor changes what fan control could be.** An LM75-compatible part
+  at I2C 0x48 (§3.3) is now declared in the DTS, so `/sys/class/hwmon/*/temp1_input`
+  gives a board temperature alongside the per-drive `drivetemp` ones. Two things
+  follow, neither done:
+  1. `ds410j-fan-control.sh` steers on drive temperature only. The board reads
+     hotter than either drive (47.7 C vs 42/39 on the bench), and it is the
+     ambient the fan actually moves, so it is arguably the better input - or the
+     daemon should take the max of both.
+  2. **In-kernel thermal control is now possible.** The sensor carries
+     `#thermal-sensor-cells = <0>` and `gpio-fan` carries `#cooling-cells = <2>`,
+     which is everything a device-tree `thermal-zones` node needs to bind them
+     with trip points and a governor. That would move fan control out of
+     userspace entirely and keep it working even if the daemon dies - a real
+     robustness gain on a box whose only reset is a power cut. The daemon would
+     still be wanted for the bay LEDs.
+- **The fan cannot be switched off by driving the pins low** [VERIFY]. The pins
+  provably reach `0 0 0` from userspace, but the chassis was not being listened
+  to at the time. If this holds it *softens* §0's fan rule: the hazard would be
+  leaving the pins as **inputs** (what an unpatched U-Boot does), not any value
+  written to them. Re-test with `ds410j-bench.sh fan step`, select `0`, wait 15 s.
+
+- **LEDs: the status and power lamps are real and controllable, just not GPIOs**
+  [CONFIRMED]. Neither MPP12 (what `gpio-leds-alarm-12`'s pinctrl selects) nor
+  GPIO 21 (what its `gpios` property names) lights anything, and DSM's
+  `ds410j_synobios.ko` — recovered from `flash-backup/mtd2.bin`, byte-identical
+  to the copy on DSM's system partition, so it *is* the real module — implements
+  `SetAlarmLed`, `SetPowerLedStatus`, `SetHDDActLed` and `SetPhyLed` as bare
+  `mov r0,#0; bx lr` stubs. Mainline's `gpio-leds-alarm-12` is therefore spurious
+  here and the node is disabled.
+
+  **They belong to the board microcontroller** on UART1 (`serial@12100`, 9600
+  8N1, `/dev/ttyS0`'s sibling `/dev/ttyS1`) — the same MCU mainline already pokes
+  to power off. `synobios_ioctl` contains a raw passthrough that copies 16 bytes
+  from userspace and calls `syno_ttys_write(1, buf)`. Commands are single ASCII
+  characters, and `0x31`–`0x3B` is now a **fully mapped contiguous block**: `1`
+  power off, `2`/`3` short/long beep, `4`/`5`/`6` power LED steady/blinking/off,
+  `7` status off, `8`/`9` status green static/blink, `:`/`;` status orange
+  static/blink. The status codes came from DSM's
+  `/usr/syno/share/synogrinst/grinst-common.sh`; the rest were measured on this
+  board. Full table and safety notes in `OPERATIONS.md`.
+
+  `4`/`5` explain the front panel's default behaviour: the MCU blinks the power
+  lamp until something tells it the OS is up, which is exactly what DSM does at
+  the end of boot. `nixos/mcu-panel.nix` now does the same, and
+  `ds410j-fan-control.sh` drives the status lamp orange on the same fault
+  condition as the amber bay LEDs. `nixos/ds410j-mcu.sh` is the only writer and
+  accepts an allowlist of safe codes — it **cannot** send `1`, so no system
+  service can power the box off by getting a character wrong.
+
+  Unmapped: letters. `t` appears in DSM's shutdown path and is unidentified;
+  `k`/`l` are wake-on-LAN, not LEDs. If a reset command exists it is most likely
+  a letter, since the protocol otherwise uses plain printable characters.
+
+- **Bay LED colour mapping confirmed on all four bays** [CONFIRMED]. Bays 2 and 4
+  came from the original LED walk; bays 1 and 3 were settled by moving both
+  drives there, at which point those greens lit and 2/4 went dark. Presence
+  gating confirmed in both directions. GPIO 44/45 tested and light nothing.
+
+- **The two pins of a bay are one bi-colour LED, not two lamps.** All four
+  combinations, [CONFIRMED] on hardware:
+
+  | even pin (36/38/40/42) | odd pin (37/39/41/43) | result |
+  |---|---|---|
+  | high | low | **amber**, whether or not a drive is fitted |
+  | low | high | **green**, but only with a drive fitted - empty bay stays dark |
+  | high | high | **dark** |
+  | low | low | dark |
+
+  Two independent LEDs both driven would light, not go dark, so this behaves as
+  one anti-parallel bi-colour LED with the green direction's return path routed
+  through the drive connector [LIKELY mechanism]. The asymmetry is what produced
+  the two "nothing" rows in the original walk.
+
+  This bit: `update_leds` originally set green from presence and amber from
+  temperature independently, so a drive that was present *and* too hot got both
+  pins high and showed **nothing at all** - precisely the case that most needs a
+  lamp. They are now mutually exclusive with amber winning, and
+  `test-fan-control.sh` has a regression test. Anything else driving these pins
+  needs the same rule; there is no DT binding that expresses the constraint, so
+  `gpio-leds` cannot enforce it.
+
+  Useful corollary: **amber is the only colour an empty bay can show**, which is
+  what would make "expected drive missing" expressible if we ever want it.
+- **Per-bay disk-activity LEDs need userspace.** 6.12's `disk-activity` trigger
+  is global: one call site, `ledtrig_disk_activity(bool write)` in
+  `libata-core.c`, with no device parameter, so binding it to all four greens
+  blinks them in unison. `ledtrig-blkdev` was proposed upstream but is not in
+  6.12. Doing it per bay means polling `/proc/diskstats` — one file read gives
+  all four bays — at a few Hz. Not done; the daemon currently drives green as
+  steady "drive present". One upside of the global trigger: it is libata-only,
+  so the USB boot stick would not blink it.
+
 - **Reboot.** §3.3. `orion_wdt` loads but its restart handler does not take effect.
   Since `poweroff` *does* work through the board's microcontroller, the likely
   avenue is that the same MCU accepts a reset command — worth tracing what the
   Synology variant of `POWER_RESET_QNAP` does [VERIFY]. For a headless 24/7 NAS
   this matters as much as poweroff did.
-- **LEDs and the reset button.** `gpio-leds` and `gpio-keys` nodes exist in
-  `kirkwood-synology.dtsi`; `ds409.dts` enables the HDD and alarm LEDs. Untested.
-- **CESA and `mv_xor`.** Untested. CESA matters for §7.2.
+- **The front-panel buttons appear not to be software-visible at all** [LIKELY,
+  with one blind spot below]. `PORTING.md` previously said "`gpio-keys` nodes
+  exist in `kirkwood-synology.dtsi`" — **they do not**. There is no `gpio-keys`,
+  `gpio_keys`, `linux,code` or `KEY_*` anywhere in the Marvell Kirkwood tree, so
+  there was never anything to enable. That claim was wrong and is withdrawn.
 
+  The kernel side needs nothing: `CONFIG_KEYBOARD_GPIO=y`, `INPUT_EVDEV=y` and
+  logind's default `HandlePowerKey=poweroff` are all in place. There are simply
+  no input devices and no `/dev/input`, because nothing declares a button. What
+  is missing is a pin — and the evidence says there isn't one:
+
+  | test | result |
+  |---|---|
+  | `ds410j-bench.sh button hunt`, 39 unclaimed GPIO lines | no change on either button |
+  | `mcu listen`, power **and** reset pressed | `rx:0` — the MCU says nothing |
+  | 10-second hold on the power button | no power-off; the MCU does not act either |
+  | DSM kernel, 6883 symbol strings | **zero** button/btn/keypad symbols |
+  | DSM `SYNO_CTRL_*` set (10 entries) | no button entry; LEDs, fan, buzzer only |
+  | `ds410j_synobios.ko` | no button functions; `GetGpioPin` called only by `GetFanSpeedBits` |
+  | `synoinfo.conf` | `usbcopy="no"`, and no `support_*button*` key |
+
+  scemd's `event_microp.c` does handle "power button pressed", but that is
+  generic scemd code compiled for every model; on this one nothing ever feeds it.
+  Consistent with the rest of the DS410j's character - the same model whose
+  synobios stubs out every LED setter.
+
+  **The blind spot**, and it is a real one: `pinmux-pins` shows most pins as
+  `(MUX UNCLAIMED)`, meaning Linux never muxed them and they hold whatever U-Boot
+  left. `gpioget` only reflects the pad when a pin is genuinely in gpio mode, so
+  a button on a pin sitting in some other MPP function would be invisible to
+  `button hunt`. Closing it means reading the MPP registers — `/dev/mem` is
+  present but `CONFIG_STRICT_DEVMEM=y` blocks MMIO, so it wants `md 0xF1010000 8`
+  at the U-Boot prompt. Worth doing on the next reboot, since if a pin turns out
+  to be muxed away from gpio, muxing it back is exactly what a board-specific DTS
+  is for. Until then this is [LIKELY], not settled.
+
+  Also untested: whether the MCU needs telling to *enable* button reporting. That
+  would be another unmapped command character.
+- **CESA and `mv_xor`.** Untested. CESA matters for §7.2.
 ### 7.2 LUKS
 
 Wanted: encrypted data volumes on the SATA array. Several things about this box
@@ -454,6 +830,29 @@ anything, because two of them are baked in at `luksFormat` time.
   initrd — heavy here, and moot if root is unencrypted).
 
 ### 7.3 Smaller items
+
+- **kwboot: is this board actually brickable?** [VERIFY, and it would rewrite §0]
+  The safety model rests on mtd0 being "the only recovery path short of a SOIC
+  clip". The 88F6281 has a mask-ROM BootROM that, per `kwboot(1)`, polls UART0 on
+  every power-up for a handshake that starts an xmodem upload; U-Boot's `kwboot`
+  implements it and names Kirkwood explicitly, citing the 88F6281 functional spec
+  ch. 24.2. If it answers here, the SoC has a recovery path **no flash write can
+  damage**, and the worst case drops from desoldering the SPI chip to plugging in
+  a serial cable.
+
+  `kernel/kwboot-test.sh` probes it and writes nothing — handshake only, no image
+  uploaded, worst case a power cycle. It must be running *before* the board is
+  powered on, because the polling window is short.
+
+  If it works, §0's rules should be re-graded rather than deleted: mtd0 stays the
+  cheaper recovery so "never `bubt`" remains sound practice, but the
+  catastrophic-risk tier disappears and things currently ruled out — reflashing
+  mtd0 with our own loader, collapsing the two-stage chain — become merely
+  inconvenient rather than terminal. That is a bigger change to this project's
+  shape than anything else outstanding, which is why it is worth an early answer.
+
+  Caveat: it only helps with a serial console attached. That is always true on
+  this bench and never true for a box in a cupboard.
 
 - **`boot.initrd.enable = false`.** The durable fix for §6.2's deprecation warning,
   and it removes the initrd from the RAM budget entirely. The USB -> SCSI -> ext4
