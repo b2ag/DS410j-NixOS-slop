@@ -75,13 +75,13 @@ down; this list exists so they are not lost.
    neither reproduce it deliberately nor reverse it.
 
 3. **The power button does not work, and finding it is the top priority.** (§7.1)
-   DSM shuts the box down on a short press, so a mechanism exists. Every
-   input-capable SoC GPIO has now been tested via `gpio-keys` except six, and the
-   MCU never transmits. The best untried step is reading the **stock** loader's
-   MPP configuration at the `Marvell>>` prompt (`md 0xF1010000 8`) and diffing it
-   against the DS109 table our U-Boot applies — direct evidence instead of
-   inference. Second: the six untested pins (MPP29/30/31/34/44/45) are drive
-   power enables, so test them **with the bays empty**.
+   DSM shuts the box down on a short press, so a mechanism exists. The stock
+   loader's own pinmux has now been read (§7.1, "The stock loader's pinmux"),
+   which narrowed the candidates from fourteen to **three: MPP29, 44 and 45**.
+   Every other GPIO on real DS410j hardware is either tested-and-negative or
+   accounted for as the fan or the bay LEDs. Those three are drive-power enables,
+   so test them **with the bays empty**, or under a stock DSM kernel where the
+   buttons demonstrably work.
 
 Everything else outstanding is in §7.
 ---
@@ -818,6 +818,55 @@ partition 2 shows the `FDT` line (`OPERATIONS.md`).
   owns LED blink rates and beep lengths autonomously, with no host traffic while
   a lamp blinks), and such a device plausibly was never designed to report
   anything, which would explain `rx:0` as intent rather than defect.
+
+#### The stock loader's pinmux — what the hardware actually uses
+
+Read at the `Marvell>>` prompt with `md 0xF1010000 8`, decoded against
+`pinctrl-kirkwood.c` for the f6281 variant. This is **direct evidence about
+DS410j hardware**, as opposed to inference from the DS109 table our own U-Boot
+applies, and it narrowed the button search from fourteen candidates to three.
+
+```
+f1010000: 00002222 03303311 33330000 33003333
+f1010010: 00005533 00000000 00000000 00000000
+```
+
+| pins | stock function |
+|---|---|
+| 0-3 | spi (cs, mosi, sck, miso) |
+| 4 | **gpio** |
+| 5, 7, 18, 19 | gpo (output-only) |
+| 6 | `sel 0` — undefined for MPP6; not a GPIO |
+| 8-9 | twsi0 (i2c: RTC + the LM75) |
+| 10-11 | uart0 (our console) |
+| 12 | **gpio** |
+| 13-14 | uart1 (the MCU) |
+| 15-17 | **gpio** — the fan |
+| **20-27, 30-33** | **ge1** — the second gigabit ethernet |
+| **34-35** | **sata0/1.act** |
+| 28, 29 | **gpio** |
+| 36-49 | **gpio** — 36-43 are the bay LEDs |
+
+Two things fall out, and the second is the useful one.
+
+**Our round-2 gpio-keys sweep was largely wasted.** MPP22-28, 32 and 35 were
+tested because the *DS109* table calls them GPIO. On real DS410j hardware they
+are ethernet and SATA activity, so no press could ever have appeared there.
+
+**The complete set of GPIO pins on this board is small, and all but three are
+accounted for:** 4, 12, 28, 46, 47, 48, 49 tested and negative; 15-17 the fan;
+36-43 the bay LEDs. That leaves **29, 44 and 45** — the only pins that are GPIO
+on real hardware and have never been tested. They were excluded from round 2
+because `kirkwood-synology.dtsi` names them `pmx_hdd1_pwr_29`,
+`pmx_hdd3_pwr_44`, `pmx_hdd4_pwr_45` and flipping a live drive-power enable to
+an input could cut power to a fitted disk. That exclusion also removed 30, 31
+and 34, which the stock config now rules out independently.
+
+Also worth noting: the stock banner prints `Fan Status: Good`, so the stock
+loader reads a fan sensor. And [CONFIRMED] the power button does nothing at the
+`Marvell>>` prompt either, not even held - no OS has spoken to the MCU at that
+point, which argues the MCU does not act on the button at all, and pushes the
+answer back towards a GPIO the OS is meant to read.
 - **CESA and `mv_xor`.** Untested. CESA matters for §7.2.
 ### 7.2 LUKS
 
