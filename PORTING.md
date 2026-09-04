@@ -1357,11 +1357,85 @@ A power cycle returns to the flashed image with nothing to undo. Note that the
 old kernel's module tree loaded fine into the new kernel (`zram` came up
 normally) - same version, no `MODVERSIONS`, no `MODULE_SIG`.
 
-**Disk state:** `/dev/sdb` was cleared for this work, so `kyle:data1` is gone. It
-now carries a GPT with a single 16 GiB `sdb1` formatted as empty ext4, labelled
-`ds410j-scratch`; the remaining ~2.7 TB is unallocated. **`/dev/sdc` was never
-touched** - it still holds the original DSM (sdc1 system, sdc2 swap, sdc3 data)
-kept as a reference.
+**Disk state:** `/dev/sdb` and `/dev/sdc3` were both cleared for this work (the
+owner confirmed `kyle:data1` and `sdc3` were expendable), so `kyle:data1` is gone.
+`sdb` now carries a GPT with a single full-disk `sdb1` (5860531080 sectors, a
+multiple of 8 so `--sector-size 4096` is usable); `sdc3` is unchanged in geometry
+and already 4 KiB-aligned, so `sdc`'s partition table was never rewritten. Both
+partitions are wiped of signatures and hold nothing. **`sdc1` and `sdc2` - the
+original DSM system and swap, kept as a reference - were never opened.**
+
+#### 7.2.2 btrfs raid1 over LUKS, and what sftp actually delivers
+
+Measured 2026-09-04 on a third test kernel (kernel 2 plus `BTRFS_FS`), on two
+2.7 TB partitions - `sdb1` and `sdc3`, both cleared by the owner. 250 MB buffered
+through the filesystem, **CPU at 100% in every single row**:
+
+| layout | write | read |
+|---|---|---|
+| ext4, unencrypted | 44.6 | 62.2 |
+| btrfs single device, unencrypted | 27.9 | 36.7 |
+| btrfs **raid1**, unencrypted | 19.6 | 36.6 |
+| btrfs single device on LUKS/Adiantum | 9.0 | 12.0 |
+| **btrfs raid1 over two LUKS/Adiantum containers** | **6.2** | **12.2** |
+| btrfs raid1 over two LUKS/aes-cbc-essiv (CESA, patched) | **10.2** | **17.9** |
+
+Three things worth knowing before committing to this layout:
+
+- **raid1 costs ~30% on writes and nothing on reads.** 27.9 -> 19.6 unencrypted,
+  9.0 -> 6.2 encrypted - the same proportion both times. Reads are free
+  (36.7 -> 36.6) because btrfs serves them from one copy, so the second container
+  is never touched. An earlier estimate here said "roughly halves writes"; that
+  was too pessimistic.
+- **btrfs itself is not free on this CPU.** Unencrypted, it gives up ~37% write
+  and ~41% read against ext4 (27.9/36.7 vs 44.6/62.2) to CoW and crc32c
+  checksums, before any encryption. On a box with no spare cycles that is the
+  price of checksums and self-healing, and it is paid whether or not LUKS is
+  involved.
+- **raid1 is where CESA earns the most**: +65% write and +47% read over Adiantum,
+  because raid1 doubles the encryption work and the DMA engine absorbs the
+  doubling while Adiantum pays for it in CPU.
+
+**But sshd is the real ceiling.** scp of 200 MB onto the box:
+
+| target | throughput |
+|---|---|
+| unencrypted ext4 - i.e. what sshd alone costs | **4.9** |
+| ext4 on LUKS/CESA | 4.0 |
+| ext4 on LUKS/Adiantum | 3.7 |
+| btrfs raid1 on LUKS/CESA | 3.5 |
+| btrfs raid1 on LUKS/Adiantum | 2.9 |
+
+With **no** disk encryption at all, sftp still tops out at 4.9 MB/s with the CPU
+pegged - sshd's own crypto, which cannot use CESA either. So the 4 MB/s gap
+between Adiantum and CESA in local writes collapses to 0.6 MB/s (+21%) over the
+network. Choose the cipher on that number, not on the local one, unless the box
+will do large local writes (a scrub, a restore, `btrfs send`) where the full +65%
+applies.
+
+Changing the **ssh** cipher does not help - the negotiated default is already the
+best of what this CPU can do:
+
+| ssh cipher | scp throughput |
+|---|---|
+| **chacha20-poly1305@openssh.com** (default) | **4.9** |
+| aes128-ctr | 3.8 |
+| aes256-ctr | 3.5 |
+| aes256-gcm@openssh.com | 3.0 |
+| aes128-gcm@openssh.com | 2.7 |
+
+Same lesson as Adiantum vs AES-XTS: ChaCha beats AES on a CPU with no AES
+instructions. OpenSSH's AES modes go through OpenSSL's ARM assembly and still
+lose to its portable-C ChaCha.
+
+**What btrfs needs that the image does not have:**
+
+- `CONFIG_BTRFS_FS` - absent. The shipped kernel knows only ext2/3/4, cramfs,
+  vfat and msdos, because `fs/` is not in `gen-driver-modules.py`'s `INCLUDE`
+  list. `BTRFS_FS = yes` pulls in crc32c, lzo and zstd by itself.
+- `btrfs-progs` in `environment.systemPackages`. It **cross-builds clean** for
+  armv5tel (7.1, 10-path closure) and needs no Rust. Only `lzo` was missing from
+  the device's store.
 
 ### 7.3 Smaller items
 
