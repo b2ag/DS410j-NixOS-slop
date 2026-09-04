@@ -1,10 +1,11 @@
 # Read-only root: nothing on the USB stick is written after it is flashed.
 #
-# WHY, on this box specifically: warm reboot does not work (PORTING.md 3.3), so
-# *every* reset is a hard power cut. That is exactly the situation that corrupts
-# a read-write root, and it is not an occasional accident here - it is the normal
-# way this machine restarts. Making the filesystem read-only removes the failure
-# mode rather than mitigating it.
+# WHY, on this box specifically: this machine is restarted abruptly more than
+# most. Warm reboot now works (PORTING.md 3.3 - the MCU takes a 'C'), so a clean
+# `systemctl reboot` is finally available, but the box still has no watchdog
+# reset path of its own and a stranded box is still recovered by cutting mains.
+# A read-only root removes the corruption failure mode rather than mitigating
+# it, which is worth keeping even now that the common case is clean.
 #
 # The clean mechanism, `system.etc.overlay`, is unavailable: it asserts
 # `boot.initrd.systemd.enable`, and the systemd initrd came to 56.7 MB and OOM'd

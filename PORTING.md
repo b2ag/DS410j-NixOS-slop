@@ -308,55 +308,42 @@ the shutdown as intentional - and `7` (status LED off) at the end, next to
 but our shutdown never sends it and the box still stayed off across an AC cycle,
 so it is not that. `t` remains unidentified and is now less likely to be
 power-related.
-**BREAKTHROUGH 2026-09-04: writing `"EC1"` to the MCU restarts the board.**
-[OBSERVED once, cause not yet isolated.] With the box running NixOS normally, a
-single write of the three bytes `E`, `C`, `1` to
-`/sys/kernel/debug/synology-mcu/send` took it straight from running Linux to the
-stock Marvell U-Boot banner, **and it came back up by itself with nobody touching
-the front panel**:
+**WARM REBOOT IS SOLVED. The command is `C` (0x43) to the MCU.**
+[CONFIRMED on hardware 2026-09-04, reproduced 2/2, and `systemctl reboot` now
+works.] `nixos/synology-mcu` registers a `SYS_OFF_MODE_RESTART` handler that
+sends it, at `SYS_OFF_PRIO_HIGH` so it beats `orion_wdt`'s restart handler, which
+registers but has no effect on this SoC.
 
 ```
-synology-mcu serial0-0: sending the multi-byte command "EC1" one byte at a time...
+reboot: Restarting system
         __  __                      _ _
        |  \/  | __ _ _ ____   _____| | |     ** LOADER **
 U-Boot 1.1.4 (Mar 17 2010 - 19:27:44) Marvell version: 3.4.4
 ```
 
-No shutdown, no `Power down`, no human. That is the software-triggered restart
-this section has been missing.
+Back to a login prompt unaided, `systemctl is-system-running` = `running`, zero
+failed units.
 
-**What is NOT yet known, and matters:**
+**How it was found, because the route matters.** Not by attacking reboot at all.
+The DS207 command table lists `"EC1"` as *enable CPU fan check*; sending it
+restarted the box. So did `"EC0"`. `E` alone did nothing. `C` alone did it. The
+escape sequence was never the point — the `C` inside it was, and `C` **is not in
+the DS207 table at all**. It was found by accident, testing something unrelated,
+through the debugfs `send` file. That interface earning its keep on the first day
+is the argument for keeping raw access available.
 
-- **Which byte did it.** The bytes went out individually as `E`, `C`, `1`. It is
-  *not* simply the `1`: a lone `1` is `SHUTDOWN`, and a soft-off box demonstrably
-  stays off until someone presses the button. Something about `E`/`C`, or the
-  sequence, changes the outcome.
-- **Whether it is a true warm reset or an MCU-initiated power cycle.** The stock
-  loader banner appears either way. The distinguishing fact is that it *returned
-  unaided*, which a host-initiated soft-off never does - so if it is a power
-  cycle, the MCU is driving it, not the host.
+**Still open: is it a true warm reset or an MCU-initiated power cycle?** The
+stock loader banner is identical either way, and nothing so far distinguishes
+them. What is established is that the box returns unaided, which a
+host-initiated soft-off never does. Worth settling eventually, because it
+determines whether the drives get a clean power transition — though systemd has
+already unmounted everything by the time the handler runs.
 
-**Next tests, in this order, with a human present** (each is one write to the
-debugfs `send` file):
+Consequences for the rest of this document: statements below that the SoC
+"cannot be reset" describe Linux's and U-Boot's own reset paths, which remain
+true and unused. The board can be restarted; it just needs the MCU asked.
 
-1. `"EC0"` - differs only in the last byte. If it also restarts, the trigger is
-   `E`/`C` and nothing to do with `1`.
-2. `E` alone, then `C` alone - isolates it to a single byte.
-3. If a single byte does it, that byte is the restart command, and
-   `nixos/synology-mcu` should register a `SYS_OFF_MODE_RESTART` handler for it
-   exactly as it already does for power-off. The UART mapping is already there.
-
-Until then do not treat this as reliable: it is one observation.
-
-**Warm reboot does not work yet — but DSM does it, so it is possible.** Stock DSM
-offers a reboot and it works on this hardware, which means the board has a
-mechanism we have not identified. Treat every "cannot reset this SoC" statement
-below as "we have not found how", not as a hardware limit. Now that the MCU
-protocol is largely mapped and `nixos/synology-mcu` already owns the UART and a
-sys-off handler, that driver is the natural place to put a restart handler once
-the command is known.
-
-`systemctl reboot` completes the entire shutdown —
+**Historical, kept for the reasoning.** `systemctl reboot` used to complete the entire shutdown —
 unmounts, swaps off, SCSI caches flushed — and then hangs at
 `reboot: Restarting system`. Neither Linux nor U-Boot 2026.07 can reset this SoC;
 the *stock* loader can, so the hardware path exists and mainline does not reach it.
@@ -922,10 +909,10 @@ are recorded so nobody re-runs them:
 **The reader is written: `nixos/synology-mcu/`, a serdev kernel driver.** Not a
 userspace daemon — in kernel space the bytes become real input events, so a
 power-button hold arrives as `KEY_POWER` and logind applies its ordinary policy
-with nothing holding a tty. `0x61` becomes `KEY_RESTART` rather than an actual
-reboot, because warm reboot is not solved yet (§3.3) — DSM manages it, so the
-mechanism exists and is simply unknown — and until it is, the policy belongs in
-userspace. Fan-failure bytes are logged at `dev_crit`.
+with nothing holding a tty. `0x61` becomes `KEY_RESTART` rather than
+triggering a reboot directly, so the policy stays in userspace where logind can
+apply it — and since warm reboot now works (§3.3), that key can actually do
+something if it is ever bound. Fan-failure bytes are logged at `dev_crit`.
 
 **[CONFIRMED on hardware, 2026-09-04.] Flashed, booted, and the power button
 works end to end.** The whole chain is in the serial log:

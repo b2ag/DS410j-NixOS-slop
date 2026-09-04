@@ -152,11 +152,12 @@ device with no software recovery path:
   known-good stock configuration.
 - A modern U-Boot is chainloaded from the stock U-Boot into the freed `zImage` slot; it
   never replaces the stock loader. Verified working in RAM (`PORTING.md` §5.1).
-- **Warm reboot does not work *yet*, but there is now a live lead** — neither
-  Linux nor U-Boot 2026.07 can reset this SoC, and DSM reboots this board fine,
-  so a mechanism exists. **Writing `"EC1"` to the MCU restarted the box
-  unaided** (PORTING.md §3.3, observed once); which of `E`/`C`/`1` does it is not
-  yet isolated. Do not treat warm reboot as impossible.
+- **Warm reboot WORKS. The command is `C` (0x43) to the MCU** (PORTING.md §3.3)
+  [CONFIRMED, reproduced 2/2]. Neither Linux nor U-Boot 2026.07 can reset this
+  SoC by themselves, and `orion_wdt`'s restart handler has no effect — but
+  `nixos/synology-mcu` registers a `SYS_OFF_MODE_RESTART` handler at
+  `SYS_OFF_PRIO_HIGH` that asks the MCU, and **`systemctl reboot` now works**.
+  A remote power cycle is no longer the only way to restart the box.
   A power cycle is still required, but the box **powers itself on when AC is
   restored**, and a remote outlet is now wired and verified
   (`kernel/ds410j-power.sh`). What enabled that behaviour is unknown (§3.3) - do

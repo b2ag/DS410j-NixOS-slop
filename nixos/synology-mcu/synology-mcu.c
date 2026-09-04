@@ -35,14 +35,11 @@
  * requesting the region, so it does not collide with the 8250 that owns the port
  * (which is exactly how the mainline driver coexists with it today).
  *
- * What this driver deliberately does NOT do:
+ * WARM REBOOT works too, and the command is 'C' (0x43) - see mcu_restart()
+ * below. That was an open problem for the whole project: neither Linux nor
+ * U-Boot can reset this SoC, and orion_wdt's restart handler has no effect.
  *
- *   Reboot.  Warm reboot is not solved on this board YET - DSM offers a reboot
- *   and it works, so a mechanism exists and we have not found it (PORTING.md
- *   3.3). Whatever it turns out to be, this driver is the natural home for it:
- *   the UART mapping and a sys-off handler are already here, so a restart
- *   handler would be a few lines once the command is known. Until then 0x61
- *   becomes KEY_RESTART and userspace decides.
+ * What this driver deliberately does NOT do:
  *
  *   Blink.  The lamps are exposed as plain on/off LED class devices using
  *   brightness_set_blocking, which is the callback that is guaranteed to be
@@ -175,6 +172,7 @@
 
 /* host -> MCU, only the ones this driver itself emits */
 #define MCU_CMD_SHUTDOWN	'1'
+#define MCU_CMD_RESTART		'C'
 #define MCU_CMD_LED_POWER_ON	'4'
 #define MCU_CMD_LED_POWER_OFF	'6'
 #define MCU_CMD_LED_HD_OFF	'7'
@@ -602,11 +600,47 @@ static int mcu_power_off(struct sys_off_data *data)
 	return NOTIFY_DONE;
 }
 
+/*
+ * Warm reboot, which this board was long thought incapable of.
+ *
+ * 'C' (0x43) restarts the box: from running Linux straight to the stock Marvell
+ * loader banner, coming back unaided with nobody at the front panel. Found by
+ * accident while trying the DS207 table's "EC1" (enable CPU fan check), which
+ * restarted the box; "EC0" did too, 'E' alone did nothing, and 'C' alone did it
+ * - so the escape sequence was never the point, the 'C' in it was. Reproduced
+ * 2/2. It is NOT in the DS207 command table at all.
+ *
+ * Whether this is a true warm reset or an MCU-initiated power cycle is still
+ * open - the loader banner looks identical either way. What matters here is
+ * that it returns unaided, which a host-initiated soft-off never does.
+ *
+ * Same constraints as the power-off handler, so the same direct-register
+ * approach: by the time this runs the tty layer is gone and nothing may sleep.
+ */
+static int mcu_restart(struct sys_off_data *data)
+{
+	struct syno_mcu *mcu = data->cb_data;
+	void __iomem *base = mcu->uart;
+
+	writel(UART_LCR_DLAB | UART_LCR_WLEN8, base + (UART_LCR << 2));
+	writel(mcu->divisor & 0xff, base + (UART_DLL << 2));
+	writel((mcu->divisor >> 8) & 0xff, base + (UART_DLM << 2));
+	writel(UART_LCR_WLEN8, base + (UART_LCR << 2));
+	writel(0, base + (UART_IER << 2));
+	writel(0, base + (UART_FCR << 2));
+	writel(0, base + (UART_MCR << 2));
+
+	writel(MCU_CMD_RESTART, base + (UART_TX << 2));
+
+	return NOTIFY_DONE;
+}
+
 static int mcu_setup_power_off(struct syno_mcu *mcu, u32 baud)
 {
 	struct device_node *np = mcu->dev->parent->of_node;
 	unsigned long tclk;
 	struct clk *clk;
+	int ret;
 
 	mcu->uart = of_iomap(np, 0);
 	if (!mcu->uart)
@@ -624,9 +658,19 @@ static int mcu_setup_power_off(struct syno_mcu *mcu, u32 baud)
 
 	mcu->divisor = DIV_ROUND_CLOSEST(tclk, 16 * baud);
 
-	return devm_register_sys_off_handler(mcu->dev, SYS_OFF_MODE_POWER_OFF,
-					     SYS_OFF_PRIO_DEFAULT,
-					     mcu_power_off, mcu);
+	ret = devm_register_sys_off_handler(mcu->dev, SYS_OFF_MODE_POWER_OFF,
+					    SYS_OFF_PRIO_DEFAULT,
+					    mcu_power_off, mcu);
+	if (ret)
+		return ret;
+
+	/*
+	 * Priority above the default so this beats orion_wdt's restart handler,
+	 * which registers but does not actually reset this SoC (PORTING.md 3.3).
+	 */
+	return devm_register_sys_off_handler(mcu->dev, SYS_OFF_MODE_RESTART,
+					     SYS_OFF_PRIO_HIGH,
+					     mcu_restart, mcu);
 }
 
 /* --------------------------------------------------------------- probe --- */

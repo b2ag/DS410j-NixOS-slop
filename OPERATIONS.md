@@ -353,6 +353,7 @@ anything above `0x3B` as **[VERIFY]**: plausible, never tested here.
 | `0x56` | `V` | `SET_PWM_DUTY` | our fan is a 3-bit GPIO speed select, so probably n/a |
 | `0x57` | `W` | `SET_PWM_FREQ` | " |
 | `0x6c` | `l` | `WOL_ENABLE` | the write-up notes it does not work on a DS207 |
+| `0x43` | `C` | **RESTART** — not in the DS207 table | **[MEASURED]** warm reboot; the driver's `SYS_OFF_MODE_RESTART` handler sends it |
 | `0x70` | `p` | `RCPOWEROFF` | **DANGEROUS — cuts power** |
 | `0x71` | `q` | `RCPOWERON` | |
 | `0x72` | `r` | `DISABLE_SCHEDULE_POWERON` | **a lead for §3.3** (power-on after AC loss) |
@@ -383,23 +384,16 @@ monitoring stays with `gpio-fan` plus the drive temperatures. The stock loader's
 `Fan Status: Good` banner is presumably reading something else, or is simply
 unconditional.
 
-**`EC1` RESTARTS THE BOARD.** [OBSERVED once, 2026-09-04.] Writing the three
-bytes `E`,`C`,`1` to `send` took the box from running Linux straight to the stock
-Marvell U-Boot banner, with no shutdown, no `Power down`, and **no human at the
-front panel** — it came back on its own. This is a lead on warm reboot, which
-PORTING.md §3.3 has had parked as unsolved; the analysis and the next tests are
-written up there.
+**`C` (0x43) RESTARTS THE BOARD — this is warm reboot.** [CONFIRMED 2026-09-04,
+reproduced 2/2.] It is not in the DS207 table. Found by accident: `"EC1"`
+(supposedly *enable CPU fan check*) restarted the box, so did `"EC0"`, `E` alone
+did nothing, and `C` alone did it. The driver now registers a
+`SYS_OFF_MODE_RESTART` handler for it and **`systemctl reboot` works**. Full
+write-up in PORTING.md §3.3.
 
-It is **not** just the trailing `1`: a lone `1` is `SHUTDOWN`, and a soft-off box
-stays off until someone presses the button. Something about `E`/`C`, or the
-sequence, produces a restart instead. Which byte is responsible is not yet
-isolated — try `"EC0"` first, since it differs only in the last byte.
-
-`"EC0"`/`"EC1"` are the only known multi-byte commands and `"EC1"` used to be
-refused for containing a `1`. Both are now exempt when written as an exact
-three-byte write, and the driver logs a warning first, because `send` transmits
-bytes **one at a time** and nobody has established whether this MCU reassembles
-them. **Expect a restart if you send either.**
+So `"EC0"`/`"EC1"` restart the box too, by virtue of containing a `C`. They are
+exempt from the guard when written as an exact three-byte write, but there is no
+CPU fan check to be had here — sending them just reboots.
 
 **Dangerous bytes, for the avoidance of doubt:** `0x31` (shutdown) and `0x70`
 (remote power off) both cut power. `ds410j-mcu.sh`'s allowlist exists precisely so
