@@ -817,11 +817,11 @@ partition 2 shows the `FDT` line (`OPERATIONS.md`).
   steady "drive present". One upside of the global trigger: it is libata-only,
   so the USB boot stick would not blink it.
 
-- **Reboot.** §3.3. `orion_wdt` loads but its restart handler does not take effect.
-  Since `poweroff` *does* work through the board's microcontroller, the likely
-  avenue is that the same MCU accepts a reset command — worth tracing what the
-  Synology variant of `POWER_RESET_QNAP` does [VERIFY]. For a headless 24/7 NAS
-  this matters as much as poweroff did.
+- ~~**Reboot.**~~ **DONE** (§3.3). The guess in this bullet was right: the same
+  MCU does accept a reset command, and it is `C` (0x43). `orion_wdt` still loads
+  and its restart handler still has no effect, but `nixos/synology-mcu`
+  registers a `SYS_OFF_MODE_RESTART` handler at a higher priority and
+  `systemctl reboot` works.
 #### The power button: SOLVED — the MCU sends `0x30` on UART1
 
 [CONFIRMED on hardware, 2026-09-04.] **The front-panel buttons are not GPIOs.**
