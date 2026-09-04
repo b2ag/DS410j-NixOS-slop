@@ -263,7 +263,13 @@ the front-panel power button reaches software (see below).
 `nixos/synology-mcu/` is an out-of-tree module that binds UART1 as a **serdev**
 client. It turns the MCU's event bytes into input events, so a power-button hold
 arrives as `KEY_POWER` and logind applies its normal policy — no daemon sitting
-on a tty.
+on a tty. [CONFIRMED working on hardware 2026-09-04.]
+
+```
+synology-mcu serial0-0: power button       <- MCU byte 0x30, ~4 s hold
+systemd-logind[673]: Powering off...
+reboot: Power down                         <- the driver's own poweroff handler
+```
 
 **It takes the port over: `/dev/ttyS1` no longer exists** once it binds. Two
 things follow, and both are already handled:
@@ -310,6 +316,12 @@ cat /sys/kernel/debug/synology-mcu/counters        # per-event totals
 `echo 4 > send` does what it looks like). It refuses `1` and `p` — both cut
 power, and a soft-off DS410j needs a human at the front panel. Load the module
 with `allow_dangerous=1` if you mean it.
+
+**Verbatim means verbatim.** Do not redirect stderr into this file:
+`printf '1' > send 2>&1` put the shell's own error text through it, and the guard
+refused a `p` out of "Operation not permitted". The whole buffer is rejected if
+any byte in it is dangerous, so nothing was sent — but a message without a `1`
+or `p` in it would have gone to the MCU character by character.
 
 ### The wider `UART2_CMD_*` table [VERIFY — external, mostly untested here]
 

@@ -90,8 +90,8 @@ down; this list exists so they are not lost.
    test press had been a tap. No GPIO pin moves at all; the whole GPIO search was
    looking in the wrong place. Verified on unmodified NixOS: four holds gave
    `rx:4` with the ttyS1 IRQ count rising in step.
-   The reader is written — `nixos/synology-mcu/`, a serdev kernel driver that
-   emits `KEY_POWER`. Built and verified, not yet flashed (§7.1).
+   Solved and **shipped**: `nixos/synology-mcu/`, a serdev kernel driver that
+   emits `KEY_POWER`. Flashed and confirmed working on hardware (§7.1).
 
 Everything else outstanding is in §7.
 ---
@@ -887,10 +887,28 @@ reboot, because warm reboot is not solved yet (§3.3) — DSM manages it, so the
 mechanism exists and is simply unknown — and until it is, the policy belongs in
 userspace. Fan-failure bytes are logged at `dev_crit`.
 
-Built and verified on the bench, **not yet flashed**: the module cross-compiles
-warning-free with `vermagic 6.12.104 ... ARMv5` and the DT alias
-`of:N*T*Csynology,ds410j-mcu`, the DTB carries the new node, and the fan-control
-suite passes 55/55. It needs a USB stick reflash, which needs a human.
+**[CONFIRMED on hardware, 2026-09-04.] Flashed, booted, and the power button
+works end to end.** The whole chain is in the serial log:
+
+```
+synology-mcu serial0-0: Synology DS410j MCU at 9600 8N1, power-off owned here
+synology-mcu serial0-0: power button          <- MCU byte 0x30, ~4 s hold
+systemd-logind[673]: Powering off...          <- KEY_POWER reached logind
+shutdown[1]: Powering off.
+reboot: Power down                            <- the driver's own handler cut power
+```
+
+Verified on the running box: `/dev/ttyS1` is gone as designed; the debugfs
+`send`/`rx`/`counters` files exist and `send` works; the three LED class devices
+appear and green/amber clear each other in both directions; the input device
+registers as "Synology DS410j front panel" with a `kbd` handler; `ds410j-panel`
+and the fan daemon are **active**, which proves the debugfs write path works with
+no character device; the poweroff guard refuses `1`; and
+`systemctl is-system-running` reports `running` with zero failed units.
+
+Note the poweroff handler replacing `qnap-poweroff` worked first time — that was
+the part most likely to fail, since it runs after `device_shutdown()` and cannot
+use the tty.
 
 Consequences, both handled — see `OPERATIONS.md`, "The `synology-mcu` kernel
 driver":

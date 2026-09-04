@@ -33,8 +33,10 @@ Confirmed working on our own kernel.
 **`nixos/synology-mcu/` is the driver for it** — an out-of-tree serdev module
 that turns MCU bytes into input events (`KEY_POWER`), exposes the two front-panel
 lamps as LED class devices, and offers a debugfs `send`/`rx`/`counters` interface
-for experimenting with the half-mapped protocol. Built and verified, **not yet
-flashed**. It **takes over UART1, so `/dev/ttyS1` stops existing**:
+for experimenting with the half-mapped protocol. **Flashed and confirmed working
+on hardware (2026-09-04): a ~4 s hold shuts the box down cleanly via
+`KEY_POWER` -> logind -> the driver's own poweroff handler.** It **takes over
+UART1, so `/dev/ttyS1` stops existing**:
 `ds410j-mcu.sh` writes via debugfs first and falls back to the tty, and
 power-off is unaffected because that goes through mainline's `qnap-poweroff` on
 a separate DT node, never the tty. Full detail in `OPERATIONS.md`.
