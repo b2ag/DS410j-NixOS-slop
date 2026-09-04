@@ -349,7 +349,7 @@ anything above `0x3B` as **[VERIFY]**: plausible, never tested here.
 | `0x52` | `R` | `LED_MIRROR_AS` | also listed as `GET_UNIQUE_CMD` on x86 |
 | `0x53` | `S` | `LED_MIRROR_AS` | n/a here |
 | `0x54` | `T` | `LED_MIRROR_AB` | n/a here |
-| `0x55` | `U` | `TOGGLE_FAN_RPS_REPORT` | **interesting** — implies the MCU can report fan RPM, a tacho this board was thought not to have |
+| `0x55` | `U` | `TOGGLE_FAN_RPS_REPORT` | **[MEASURED] nothing happens here** — no RPM reporting on this board, see below |
 | `0x56` | `V` | `SET_PWM_DUTY` | our fan is a 3-bit GPIO speed select, so probably n/a |
 | `0x57` | `W` | `SET_PWM_FREQ` | " |
 | `0x6c` | `l` | `WOL_ENABLE` | the write-up notes it does not work on a DS207 |
@@ -379,10 +379,29 @@ something the MCU drives, so it has no tacho to read and defaults to "failed".
 It also explains why DSM sends `0x74` on its shutdown path — on this model the
 check is useless and stays disabled.
 
-`0x66`/`0x67` are therefore **not** a usable fan-failure signal here. Real fan
-monitoring stays with `gpio-fan` plus the drive temperatures. The stock loader's
-`Fan Status: Good` banner is presumably reading something else, or is simply
-unconditional.
+**And there is no fan RPM reporting either.** [MEASURED 2026-09-04.] `0x55` `U`
+(`TOGGLE_FAN_RPS_REPORT` in the DS207 table) produces **nothing at all** — not
+with fan checking off, and not with it on. With `0x75` enabled the only bytes
+that ever arrive are `0x66`, on a metronomic **~4.2 s poll**:
+
+```
+564.000157710  0x66  f  FAN_FAILURE
+568.181650520  0x66  f  FAN_FAILURE
+572.385400095  0x66  f  FAN_FAILURE
+576.589471170  0x66  f  FAN_FAILURE
+```
+
+`unknown` stayed at 0 throughout, so no RPM payload of any kind was sent. The
+regular interval is itself informative: the MCU *is* actively polling something
+and consistently concluding "failed", which is what a tacho input with nothing
+attached to it looks like.
+
+So the MCU has no working fan sense on a DS410j in any form — no failure
+detection, no RPM. That fits the wiring: the fan is a 3-bit GPIO speed select
+with no tacho line back to the MCU. `0x66`/`0x67` are therefore **not** a usable
+fan-failure signal here, and real fan monitoring stays with `gpio-fan` plus the
+drive temperatures. The stock loader's `Fan Status: Good` banner is presumably
+reading something else, or is simply unconditional.
 
 **`C` (0x43) RESTARTS THE BOARD — this is warm reboot.** [CONFIRMED 2026-09-04,
 reproduced 2/2.] It is not in the DS207 table. Found by accident: `"EC1"`

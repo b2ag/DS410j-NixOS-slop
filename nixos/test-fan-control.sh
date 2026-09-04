@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # Exercise ds410j-fan-control.sh against a fake sysfs tree.
 #
-# The board is not always to hand and every reboot of it needs a human to power
-# cycle (PORTING.md 3.3), so the temperature -> speed logic, the hysteresis and
-# the fail-safe are worth checking on the build host instead.
+# The board is not always to hand, so the temperature -> speed logic, the
+# hysteresis and the fail-safe are worth checking on the build host instead.
+# (This comment used to say every reboot needs a human to power cycle. Warm
+# reboot works now - PORTING.md 3.3 - but running the logic on the host is still
+# the faster loop.)
+#
+# KNOWN FLAKE, unresolved: one run in roughly thirteen has reported
+# "54 passed, 1 failed" (seen once on 2026-09-04, then twelve consecutive clean
+# runs). Which assertion failed was not captured - only the summary line - so
+# there is nothing to fix yet. If you see it, keep the full output: that is the
+# missing evidence. Suspect the parts that race, i.e. the daemon runs that poll a
+# background process rather than the pure arithmetic checks.
 set -uo pipefail
 cd "$(dirname "$0")"
 

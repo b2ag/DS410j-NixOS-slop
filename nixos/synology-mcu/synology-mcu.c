@@ -127,9 +127,9 @@
  *   0x52 'R'  LED_MIRROR_GS/AS       [DS207]  also listed as GET_UNIQUE (x86)
  *   0x53 'S'  LED_MIRROR_AS          [DS207]
  *   0x54 'T'  LED_MIRROR_AB          [DS207]
- *   0x55 'U'  TOGGLE_FAN_RPS_REPORT  [DS207]  implies the MCU can report fan
- *                                    RPM - a tacho this board was thought not
- *                                    to have. Untested, and interesting.
+ *   0x55 'U'  TOGGLE_FAN_RPS_REPORT  [MEASURED: does nothing here] no RPM
+ *                                    reporting on a DS410j, with fan checking
+ *                                    either on or off. See the fan note below.
  *   0x56 'V'  SET_PWM_DUTY           [DS207]  our fan is a 3-bit GPIO speed
  *   0x57 'W'  SET_PWM_FREQ           [DS207]  select, so probably n/a
  *   0x70 'p'  RCPOWEROFF             [DS207]  DANGEROUS - cuts power
@@ -166,7 +166,10 @@
  * does not work here in either direction, which fits the hardware - the fan is a
  * 3-bit GPIO speed select (gpio-fan), not something the MCU drives, so it has no
  * tacho to read and defaults to "failed". It is also why DSM sends 0x74 on its
- * shutdown path. Real fan monitoring stays with gpio-fan and the drive
+ * shutdown path. 0x55 (TOGGLE_FAN_RPS_REPORT) produces nothing either way, so
+ * there is no RPM reporting to be had. With checking on, the only traffic is
+ * 0x66 on a metronomic ~4.2 s poll - which is what a tacho input with nothing
+ * attached looks like. Real fan monitoring stays with gpio-fan and the drive
  * temperatures; treat 0x66/0x67 as unusable on a DS410j.
  */
 
