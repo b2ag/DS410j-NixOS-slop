@@ -76,6 +76,7 @@ down; this list exists so they are not lost.
    predates it - and so is "booting DSM cleared the setting", which was really
    just DSM leaving the box soft-off. Practical rule: `poweroff` is the command
    that strands the box, not the outlet.
+
 3. **The power button does not work, and finding it is the top priority.** (§7.1)
    DSM shuts the box down on a short press, so a mechanism exists. The stock
    loader's own pinmux has now been read (§7.1, "The stock loader's pinmux"),
