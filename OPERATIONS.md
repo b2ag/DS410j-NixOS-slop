@@ -383,15 +383,23 @@ monitoring stays with `gpio-fan` plus the drive temperatures. The stock loader's
 `Fan Status: Good` banner is presumably reading something else, or is simply
 unconditional.
 
-**`EC1` and the guard.** `"EC0"`/`"EC1"` are the only multi-byte commands, and
-`"EC1"` used to be refused for containing a `1`. It is now exempt when written as
-an exact three-byte write — but the exemption comes with a real caveat: `send`
-transmits bytes **one at a time**, and nobody has established whether this MCU
-reassembles `E`,`C`,`1` into one token or parses byte-at-a-time. If it is the
-latter, that trailing `1` is `SHUTDOWN` and the box powers off. The driver logs a
-warning saying so before sending. Note also that a DS410j has no separate CPU fan
-(the Kirkwood is passively cooled), so `CPUFANCHECK` probably has nothing to
-enable [LIKELY] — which makes the gamble a poor trade.
+**`EC1` RESTARTS THE BOARD.** [OBSERVED once, 2026-09-04.] Writing the three
+bytes `E`,`C`,`1` to `send` took the box from running Linux straight to the stock
+Marvell U-Boot banner, with no shutdown, no `Power down`, and **no human at the
+front panel** — it came back on its own. This is a lead on warm reboot, which
+PORTING.md §3.3 has had parked as unsolved; the analysis and the next tests are
+written up there.
+
+It is **not** just the trailing `1`: a lone `1` is `SHUTDOWN`, and a soft-off box
+stays off until someone presses the button. Something about `E`/`C`, or the
+sequence, produces a restart instead. Which byte is responsible is not yet
+isolated — try `"EC0"` first, since it differs only in the last byte.
+
+`"EC0"`/`"EC1"` are the only known multi-byte commands and `"EC1"` used to be
+refused for containing a `1`. Both are now exempt when written as an exact
+three-byte write, and the driver logs a warning first, because `send` transmits
+bytes **one at a time** and nobody has established whether this MCU reassembles
+them. **Expect a restart if you send either.**
 
 **Dangerous bytes, for the avoidance of doubt:** `0x31` (shutdown) and `0x70`
 (remote power off) both cut power. `ds410j-mcu.sh`'s allowlist exists precisely so

@@ -308,6 +308,46 @@ the shutdown as intentional - and `7` (status LED off) at the end, next to
 but our shutdown never sends it and the box still stayed off across an AC cycle,
 so it is not that. `t` remains unidentified and is now less likely to be
 power-related.
+**BREAKTHROUGH 2026-09-04: writing `"EC1"` to the MCU restarts the board.**
+[OBSERVED once, cause not yet isolated.] With the box running NixOS normally, a
+single write of the three bytes `E`, `C`, `1` to
+`/sys/kernel/debug/synology-mcu/send` took it straight from running Linux to the
+stock Marvell U-Boot banner, **and it came back up by itself with nobody touching
+the front panel**:
+
+```
+synology-mcu serial0-0: sending the multi-byte command "EC1" one byte at a time...
+        __  __                      _ _
+       |  \/  | __ _ _ ____   _____| | |     ** LOADER **
+U-Boot 1.1.4 (Mar 17 2010 - 19:27:44) Marvell version: 3.4.4
+```
+
+No shutdown, no `Power down`, no human. That is the software-triggered restart
+this section has been missing.
+
+**What is NOT yet known, and matters:**
+
+- **Which byte did it.** The bytes went out individually as `E`, `C`, `1`. It is
+  *not* simply the `1`: a lone `1` is `SHUTDOWN`, and a soft-off box demonstrably
+  stays off until someone presses the button. Something about `E`/`C`, or the
+  sequence, changes the outcome.
+- **Whether it is a true warm reset or an MCU-initiated power cycle.** The stock
+  loader banner appears either way. The distinguishing fact is that it *returned
+  unaided*, which a host-initiated soft-off never does - so if it is a power
+  cycle, the MCU is driving it, not the host.
+
+**Next tests, in this order, with a human present** (each is one write to the
+debugfs `send` file):
+
+1. `"EC0"` - differs only in the last byte. If it also restarts, the trigger is
+   `E`/`C` and nothing to do with `1`.
+2. `E` alone, then `C` alone - isolates it to a single byte.
+3. If a single byte does it, that byte is the restart command, and
+   `nixos/synology-mcu` should register a `SYS_OFF_MODE_RESTART` handler for it
+   exactly as it already does for power-off. The UART mapping is already there.
+
+Until then do not treat this as reliable: it is one observation.
+
 **Warm reboot does not work yet — but DSM does it, so it is possible.** Stock DSM
 offers a reboot and it works on this hardware, which means the board has a
 mechanism we have not identified. Treat every "cannot reset this SoC" statement
