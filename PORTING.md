@@ -1084,8 +1084,10 @@ Out of the box it costs roughly **7x the throughput** and pegs the single CPU at
 100% - but that is not the last word, because **the default configuration cannot
 reach the CESA accelerator**, and two different fixes each get most of the speed
 back. Best measured result is **18.3 / 22.7 MB/s** through ext4, against 44.6 /
-62.2 unencrypted and an 11.7 MB/s network ceiling - i.e. encryption stops being
-the bottleneck entirely.
+62.2 unencrypted. **The CPU is the ceiling in every configuration measured** -
+100% busy in every single row - so the useful comparison is against the box's own
+unencrypted throughput, not against the network. See the note on link speed
+below.
 
 Everything below was measured on TFTP-booted kernels with `DM_CRYPT` (§7.2.1),
 with the rest of the system coming off the USB stick, so nothing was flashed.
@@ -1100,7 +1102,9 @@ with the rest of the system coming off the USB stick, so nothing was flashed.
 | unencrypted ext4 (control) | 44.6 | 62.2 | - |
 
 **Adiantum is the recommendation**: it needs no patch, carries no added risk, and
-its read path already clears wire speed.
+it is the fastest option that needs no out-of-tree patch. If the workload is
+large local writes or a transport cheaper than ssh, weigh the CESA patch - see
+7.2.2.
 
 #### The measurements
 
@@ -1125,9 +1129,25 @@ Raw dm-crypt, `dd` with `O_DIRECT`, 300 MB, no filesystem:
 | **aes-cbc-essiv:sha256 / 128 / 4096 B + no workqueues** | **7.4** | **8.5** |
 
 For scale: the raw partition does 67.9 MB/s read and 91.1 MB/s write, and the
-ethernet link negotiates 100 Mb/s full duplex = 11.7 MB/s. **Every** encrypted
-configuration sits below wire speed, at 100% CPU, before Samba or NFS has run.
-Unencrypted, the box saturates its link with CPU to spare.
+**bench** ethernet link negotiates 100 Mb/s full duplex = 11.7 MB/s - but that
+is a limitation of the bench, not the board (see below). Every encrypted
+configuration runs at 100% CPU before Samba or NFS has had a cycle.
+
+**The board is gigabit; this bench is not** [CONFIRMED 2026-09-04]. The MAC is
+`mv643xx_eth` ("MV-643xx 10/100/1000 ethernet driver") and the PHY reports
+`phy_id 0x01410e40` - a Marvell 88E1116R, 10/100/1000BASE-T. Nothing in the DT
+restricts it. The 100 Mb/s link is imposed by the *container's* NIC, an ASIX
+AX88772B, which is a USB 2.0 Fast Ethernet part with no gigabit mode at all
+(OPERATIONS.md, topology). **Gigabit therefore cannot be measured on this bench**
+without a different adapter.
+
+This does not invalidate any number here: every measurement was **CPU-bound at
+100%**, none was link-bound - even the slowest, sftp at 4.9 MB/s, had 11.7 MB/s
+of link available. What changes on a gigabit link is only the framing: the
+network stops being a co-bottleneck, and the box's own CPU-bound throughput
+(44.6/62.2 unencrypted, 6.2-17.9 through btrfs raid1 on LUKS) becomes the whole
+story. The box cannot saturate gigabit in *any* configuration, encrypted or
+not.
 
 Two things move the needle, and neither is the cipher:
 
@@ -1311,9 +1331,11 @@ nothing arrived by the scoped-autoModules route.
 #### Recommendation
 
 LUKS is **feasible, and with the right cipher it is not even especially
-expensive**. Encrypted reads clear the 11.7 MB/s wire speed, so for a box serving
-a 100 Mb/s link the encryption stops being the limiting factor; only large local
-writes still feel it (9.1 MB/s vs 44.6 unencrypted).
+expensive** - but the CPU is saturated in every configuration, so what encryption
+costs is measured against the box's own unencrypted throughput (44.6/62.2 on
+ext4), not against a link. On the bench's 100 Mb/s the encrypted read path clears
+wire speed; on the gigabit link this board actually has, nothing here comes close
+to saturating it and the CPU is the only limit that matters.
 
 If it is wanted:
 
@@ -1321,9 +1343,14 @@ If it is wanted:
   double AES-XTS on this CPU, no kernel patch, no added risk. `--sector-size
   4096` is worth ~25% on its own and matches both ext4's block size and the
   drives' physical sector size.
-- Take `aes-cbc-essiv:sha256` + the dm-crypt mask patch **only** if the extra
-  9 MB/s is worth reintroducing a deadlock risk upstream deliberately removed,
-  on a 95 MB box that is awkward to power-cycle. Probably not.
+- **The cipher choice depends on the transport**, and that is the thing to settle
+  first. Over sftp the two ciphers differ by 0.6 MB/s, because sshd's own crypto
+  dominates - not worth a patch. Over a cheap transport (ksmbd with signing and
+  encryption off, §7.2.3) or for local work, `aes-cbc-essiv:sha256` + the
+  dm-crypt mask patch is worth **+65% write and +47% read** on the btrfs raid1
+  layout. That is a real gain, weighed against reintroducing a deadlock risk
+  upstream deliberately removed, on a 95 MB box that is awkward to power-cycle.
+  Decide it deliberately; do not default either way.
 - Do **not** pick a cipher from `cryptsetup benchmark` here - it measures a path
   dm-crypt does not use.
 - `--pbkdf argon2id --pbkdf-memory 32768 --pbkdf-parallel 1`, and **verify the
@@ -1436,6 +1463,33 @@ lose to its portable-C ChaCha.
 - `btrfs-progs` in `environment.systemPackages`. It **cross-builds clean** for
   armv5tel (7.1, 10-path closure) and needs no Rust. Only `lzo` was missing from
   the device's store.
+
+#### 7.2.3 The transport changes the answer: SMB, and ksmbd vs Samba
+
+sshd's 4.9 MB/s cap above is **CPU-bound, not link-bound** - it sat at 100% CPU
+with 11.7 MB/s of link unused - so a faster link does not move it. A transport
+that does not encrypt in userspace does. With SMB signing and encryption off, the
+disk path becomes the limit again, and the CESA-vs-Adiantum gap stops being
+masked: **6.2/12.2 vs 10.2/17.9 MB/s** on the btrfs raid1 layout, rather than the
+2.9-vs-3.5 that sftp reduces it to.
+
+Both servers cross-build for armv5tel. The closures decide it:
+
+| | closure | notes |
+|---|---|---|
+| **`ksmbd`** (in-kernel SMB3, `CONFIG_SMB_SERVER`) + `ksmbd-tools` 3.5.7 | **10 paths, 63 MB** | no Rust; four `ksmbd.*` helpers; most of the 63 MB is glibc already in the image |
+| Samba 4.23.10 | **97 paths, 408 MB** | cross-builds fine (contrary to expectation) but drags in **python3 for armv5tel**, dnspython, markdown, gnutls, talloc/tdb/tevent |
+
+**Samba does not fit.** The device's root partition is 581 MB and currently
+**100% full** (553 MB used, 0 available) - `sdImage` sizes it to the closure and
+`expandOnBoot = false` means it never grows. 408 MB of Samba, most of it a Python
+interpreter, on an appliance image for a 95 MB headless box is the wrong trade
+even if the partition were re-carved. `ksmbd` is the one to use.
+
+**Note the partition is full**, which affects everything in this section: adding
+cryptsetup, lvm2, btrfs-progs and ksmbd-tools all require rebuilding the image
+with a larger root partition and **reflashing the USB stick** - which needs a
+human at the bench (CLAUDE.md). Budget for that before planning the work.
 
 ### 7.3 Smaller items
 

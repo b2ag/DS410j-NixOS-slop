@@ -9,7 +9,7 @@ Read both before touching flash.
 | Thing | Value |
 |---|---|
 | Serial console | **`/dev/ttyUSB0`**, 115200 8N1, raw, no flow control (was `/dev/ttyS1` until the adapter moved to USB passthrough) |
-| Container NIC to the DS410j | `eth1` = **192.168.50.1/24** (ASIX AX88772B, USB passthrough) |
+| Container NIC to the DS410j | `eth1` = **192.168.50.1/24** (ASIX AX88772B, USB passthrough). **10/100 only - this caps the bench link at 100 Mb/s, the board is gigabit** (see below) |
 | DS410j address (set by hand each boot) | **192.168.50.50** |
 | TFTP server | dnsmasq, `enable-tftp`, root **`/var/lib/tftpboot`** (writable) |
 | DHCP pool (unused; we use static) | 192.168.50.100-200 |
@@ -19,6 +19,17 @@ The **stock** bootloader's env is RAM-only (no `saveenv`), so `ipaddr`/`serverip
 prompt. Our U-Boot has a real environment in mtd4 and remembers them.
 
 ### Physical state of the bench
+
+**The bench link is 100 Mb/s, the board is not.** The DS410j has a gigabit MAC
+(`mv643xx_eth`, "MV-643xx 10/100/1000") and a gigabit PHY (`phy_id 0x01410e40` =
+Marvell 88E1116R, 10/100/1000BASE-T), and nothing in the device tree restricts
+it. The link negotiates 100 Mb/s full duplex because the *container's* adapter is
+an ASIX AX88772B - a USB 2.0 Fast Ethernet part with no gigabit mode. **Gigabit
+cannot be measured from this bench**; it needs a different USB adapter or a
+direct path to a gigabit switch. Worth remembering before quoting any throughput
+number as a network limit: in the LUKS work (PORTING.md §7.2) every measurement
+turned out to be CPU-bound rather than link-bound, so none of them were affected,
+but the framing was wrong until this was checked.
 
 Worth knowing before interpreting anything, and easy to get wrong from a log alone:
 
