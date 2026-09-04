@@ -1066,35 +1066,302 @@ loader reads a fan sensor. And [CONFIRMED] the power button does nothing at the
 `Marvell>>` prompt either, not even held - no OS has spoken to the MCU at that
 point, which argues the MCU does not act on the button at all, and pushes the
 answer back towards a GPIO the OS is meant to read.
-- **CESA and `mv_xor`.** Untested. CESA matters for §7.2.
+- **CESA and `mv_xor`.** CESA is **[CONFIRMED] working** — `marvell-cesa
+  f1030000.crypto: CESA device successfully registered`, and it registers
+  `cbc(aes)`/`ecb(aes)` at priority 300 in `/proc/crypto`, which userspace can
+  reach through AF_ALG (measured: 16-25 MB/s AES-CBC, vs 8.8 MB/s in software).
+  It offers no XTS of its own, though Linux's XTS template is generic over an ECB
+  child, so `xts(mv-ecb-aes)` does instantiate.
+
+  **None of that helps LUKS**: dm-crypt excludes every CESA algorithm outright —
+  see §7.2 for the mechanism. Do not use CESA's presence as an argument for a
+  cipher choice. `mv_xor` still untested.
+
 ### 7.2 LUKS
 
-Wanted: encrypted data volumes on the SATA array. Several things about this box
-make it more interesting than usual, and they should be settled *before* formatting
-anything, because two of them are baked in at `luksFormat` time.
+**Answered on the hardware, 2026-09-04.** LUKS works end-to-end on this box.
+Out of the box it costs roughly **7x the throughput** and pegs the single CPU at
+100% - but that is not the last word, because **the default configuration cannot
+reach the CESA accelerator**, and two different fixes each get most of the speed
+back. Best measured result is **18.3 / 22.7 MB/s** through ext4, against 44.6 /
+62.2 unencrypted and an 11.7 MB/s network ceiling - i.e. encryption stops being
+the bottleneck entirely.
 
-- **Argon2 memory cost is the trap.** LUKS2 defaults benchmark the KDF on the
-  *formatting* machine. Format on an x86_64 box with gigabytes free and the header
-  can demand far more memory than this board has, at which point it simply cannot
-  be unlocked here. Format with an explicit cap — `--pbkdf-memory` in the tens of
-  MB, iterations tuned to taste — or use `pbkdf2`. Verify by unlocking on the
-  device, not on the build host. [VERIFY] what actually fits in 118 MB alongside
-  the rest of userspace.
-- **Cipher choice should follow CESA.** CESA accelerates AES **CBC/ECB**, not XTS
-  [VERIFY]. dm-crypt's default `aes-xts-plain64` would therefore run in software on
-  a 800 MHz ARMv5 — likely well under the 12.5 MB/s the 100 Mb/s link can carry,
-  making crypto the bottleneck. `aes-cbc-essiv:sha256` should let CESA do the work.
-  Measure both before committing; the difference decides whether the NAS is usable.
-- **Encrypt data, not root — and the initrd problem disappears.** If root stays
-  unencrypted on the USB stick and only the array is encrypted, unlocking happens
-  in ordinary userspace via systemd-cryptsetup, with no initrd involvement at all.
-  That sidesteps the deprecated scripted initrd (§6.2) entirely. Encrypting root
-  would instead force either the scripted initrd (going away) or the systemd initrd
-  (which did not fit in RAM) — so prefer data-only unless there is a reason not to.
-- **Headless unlock.** Options, in increasing order of effort: a keyfile on the USB
-  boot stick (protects against drive theft, not chassis theft); manual entry over
-  serial or ssh after boot; network unlock in initrd (needs networking in the
-  initrd — heavy here, and moot if root is unencrypted).
+Everything below was measured on TFTP-booted kernels with `DM_CRYPT` (§7.2.1),
+with the rest of the system coming off the USB stick, so nothing was flashed.
+
+**Summary of the options**, ext4 on the encrypted volume, 250 MB buffered:
+
+| option | write | read | cost |
+|---|---|---|---|
+| stock dm-crypt, AES, 512 B sectors | 6.3 | 7.9 | - |
+| **Adiantum (`xchacha12,aes-adiantum-plain64`)** | **9.1** | **13.8** | none - upstream cipher, 4 kernel symbols |
+| **AES via CESA, dm-crypt mask patched out** | **18.3** | **22.7** | an out-of-tree kernel patch, see the risk note |
+| unencrypted ext4 (control) | 44.6 | 62.2 | - |
+
+**Adiantum is the recommendation**: it needs no patch, carries no added risk, and
+its read path already clears wire speed.
+
+#### The measurements
+
+ext4 on the encrypted volume vs the same partition unencrypted, 250 MB through
+the filesystem, buffered, caches dropped between runs (`/dev/sdb1`, Toshiba
+DT01ACA300):
+
+| | write | read |
+|---|---|---|
+| plain ext4 | **44.6 MB/s** | **62.2 MB/s** |
+| ext4 on LUKS2 (best config found) | **6.3 MB/s** | **7.9 MB/s** |
+
+Raw dm-crypt, `dd` with `O_DIRECT`, 300 MB, no filesystem:
+
+| cipher / key / sector | write | read |
+|---|---|---|
+| aes-cbc-essiv:sha256 / 256 / 512 B | 5.2 | 5.9 |
+| aes-xts-plain64 / 512 / 512 B | 5.6 | 5.8 |
+| aes-cbc-essiv:sha256 / 128 / 512 B | 6.4 | 7.2 |
+| aes-xts-plain64 / 512 / **4096 B** | 7.0 | 7.2 |
+| aes-xts-plain64 / 512 / 4096 B + no workqueues | 7.0 | 7.1 |
+| **aes-cbc-essiv:sha256 / 128 / 4096 B + no workqueues** | **7.4** | **8.5** |
+
+For scale: the raw partition does 67.9 MB/s read and 91.1 MB/s write, and the
+ethernet link negotiates 100 Mb/s full duplex = 11.7 MB/s. **Every** encrypted
+configuration sits below wire speed, at 100% CPU, before Samba or NFS has run.
+Unencrypted, the box saturates its link with CPU to spare.
+
+Two things move the needle, and neither is the cipher:
+
+- **4096-byte sectors are worth ~25%** (5.6 -> 7.0 MB/s) and cost nothing. The
+  drives are Advanced Format (`physical_block_size` 4096), so this is the right
+  choice anyway. `--sector-size 4096` at `luksFormat` time.
+- **`--perf-no_read_workqueue` / `--perf-no_write_workqueue` buy nothing here**
+  (7.0/7.2 -> 7.0/7.1). They are a real win on fast SSDs; on a CPU-bound ARMv5
+  the workqueues were never the bottleneck.
+
+A gotcha for anyone re-running this: **`--sector-size 4096` needs the partition
+size to be a multiple of 8 sectors.** The stock `sdb1` was 5860531087 sectors -
+odd - and `luksFormat` failed with "Device size is not aligned to requested
+sector size" until it was trimmed by 7 sectors.
+
+#### The default config cannot reach CESA - and that is the whole story
+
+Stock dm-crypt **excludes every CESA algorithm**, which is why the six
+configurations above land within 5.2-8.5 MB/s no matter what cipher is asked for.
+[CONFIRMED, from source and from `/proc/crypto` with a mapping open]
+
+`drivers/md/dm-crypt.c:2405` allocates its transform as
+
+```c
+cc->cipher_tfm.tfms[i] = crypto_alloc_skcipher(ciphermode, 0,
+                                CRYPTO_ALG_ALLOCATES_MEMORY);
+```
+
+The third argument is a **mask**: any algorithm carrying
+`CRYPTO_ALG_ALLOCATES_MEMORY` is excluded, because dm-crypt sits in the block
+writeback path and an algorithm that allocates per request risks deadlock under
+memory pressure. Every CESA cipher in `drivers/crypto/marvell/cesa/cipher.c`
+declares exactly that flag (it builds TDMA descriptors per request):
+
+```c
+.cra_flags = CRYPTO_ALG_KERN_DRIVER_ONLY | CRYPTO_ALG_ASYNC |
+             CRYPTO_ALG_ALLOCATES_MEMORY,
+```
+
+The binding is directly visible. Stock kernel, XTS mapping open - dm-crypt holds
+the *software* instance while the hardware one sits idle:
+
+```
+xts(aes)   xts(ecb(aes-arm))   refcnt=2   <- dm-crypt
+xts(aes)   xts(mv-ecb-aes)     refcnt=1   <- idle, AF_ALG only
+```
+
+`cryptsetup benchmark` is therefore **misleading on this hardware** and must not
+be used to choose a cipher: it goes through AF_ALG, which has no such mask, so it
+reports a hardware path that stock dm-crypt will never take.
+
+#### Removing the mask: measured, and it is worth a lot
+
+A 6-hunk patch dropping `CRYPTO_ALG_ALLOCATES_MEMORY` from dm-crypt's
+`crypto_alloc_*` calls - effectively a revert to pre-5.10 behaviour - lets CESA
+in. `refcnt` confirms dm-crypt then binds the `mv-*` instances, and raw dm-crypt
+throughput at 4096-byte sectors goes:
+
+| cipher | stock | mask removed | bound instance |
+|---|---|---|---|
+| aes-xts-plain64 / 512 | 7.0 / 7.2 | **18.5 / 19.5** | `xts(mv-ecb-aes)` |
+| aes-cbc-essiv:sha256 / 256 | ~7 | **24.8 / 25.7** | `essiv(mv-cbc-aes,sha256-asm)` |
+| aes-cbc-essiv:sha256 / 128 | 7.4 / 8.5 | **23.5 / 24.8** | `essiv(mv-cbc-aes,sha256-asm)` |
+
+**This contradicts the prediction that was made before measuring**, which was
+that offload would not help - reasoning from the comment in
+`fs/crypto/fscrypt_private.h`, where fscrypt masks the same flag *plus*
+`CRYPTO_ALG_KERN_DRIVER_ONLY` and says such drivers "can be over 50 times slower
+than the CPU-based code for fscrypt's workload... Even on platforms that lack AES
+instructions on the CPU, using the offloads has been shown to be slower". That is
+true for **fscrypt's** workload and is not transferable: fscrypt encrypts
+individual pages, while dm-crypt at a 4096-byte sector hands CESA whole bio
+segments that its TDMA engine can chain. Do not reason about this board's
+dm-crypt performance from the fscrypt comment - measure it.
+
+**The risk is unchanged and is the reason this is not the default recommendation.**
+The flag exists because CESA does `dma_pool_alloc(..., GFP_KERNEL : GFP_ATOMIC)`
+per request; allocating memory in order to write out dirty pages can deadlock
+under memory pressure. On a 95 MB box with zram that is a live scenario, and the
+failure mode is a hang needing a power cycle - on a board whose power-on after AC
+loss is not reliable (§3.3). The patch is in
+`nixos/dm-crypt-allow-allocating-drivers.patch` for anyone who wants to make that
+trade knowingly; it is **not** applied in the shipped build.
+
+#### Adiantum: most of the win, none of the risk
+
+The same fscrypt comment points at the right answer for a CPU with no AES
+instructions, and here it holds up. Adiantum (XChaCha + NH + Poly1305) is a
+mainline dm-crypt cipher needing only `CRYPTO_ADIANTUM`, `CRYPTO_CHACHA20` and
+`CRYPTO_NHPOLY1305`:
+
+| cipher (4096 B sectors, stock dm-crypt) | write | read |
+|---|---|---|
+| aes-xts-plain64 / 512 | 7.0 | 7.2 |
+| **xchacha12,aes-adiantum-plain64** | **13.4** | **14.8** |
+| xchacha20,aes-adiantum-plain64 | 11.6 | 12.4 |
+
+Roughly **double** AES-XTS, with no patch and no deadlock risk, because ChaCha is
+cheap in software where table-based AES is not. Note `CRYPTO_CHACHA20_NEON` has
+no `depends on KERNEL_MODE_NEON` - the ARM glue selects NEON at runtime and falls
+back to scalar assembly - so this board gets `chacha20-arm` (priority 200), not
+the portable C. The bound instance is
+`adiantum(xchacha12-arm,aes-arm,nhpoly1305-generic)`.
+
+xchacha12 beats xchacha20, as designed; 12 rounds is the variant Adiantum was
+built around.
+
+#### Argon2: the trap is real, and it is measurable
+
+Measured on the box, 256-bit key, 2000 ms target:
+
+| KDF | result |
+|---|---|
+| PBKDF2-sha1 | 50,646 iter/s |
+| PBKDF2-sha256 | 82,022 iter/s |
+| PBKDF2-sha512 | 26,554 iter/s |
+| argon2id, 16 / 32 / 48 MiB | 4 iterations - OK |
+| argon2id, 64 MiB | **OOM-killed** |
+| argon2id, cryptsetup's own default | **OOM-killed** (`total-vm:114060kB` on a 95 MB box) |
+
+The ceiling is between 48 and 64 MiB, and cryptsetup's unaided default does not
+fit **even when formatting on the device itself**. A header formatted on an
+x86_64 host with default settings is permanently unopenable here.
+
+Use `--pbkdf-memory 32768`. At that setting a real header takes **~23 s to
+format** and **~6-7 s to unlock** on the device (argon2id, 10304 iterations,
+1 thread) - a one-off cost at boot, and acceptable.
+
+#### Userspace: already present, except for one option
+
+- `pkgsCross.armv5tel-multiplatform.cryptsetup` (2.8.6) **cross-builds clean and
+  pulls in no Rust**. Its closure is 13 paths and **twelve are already on the
+  device**, including `libcryptsetup`. Only the 424 KB `-bin` output is missing.
+- The shipped image already carries `systemd-cryptsetup` and
+  `systemd-cryptsetup-generator`.
+- **`services.lvm.enable = false` (nixos/configuration.nix) must be reversed.**
+  This is not optional and it is not obvious. nixpkgs' own option description
+  says it outright: *"The lvm2 package contains device-mapper udev rules and
+  without those tools like cryptsetup do not fully function!"*
+
+  The failure mode is a **hang, not an error**. libdevmapper (shipped by lvm2,
+  linked by cryptsetup, which advertises `flags: UDEV`) creates the mapping with
+  udev synchronisation on: it allocates a cookie - a SysV semaphore - passes it
+  into the DM ioctl so the kernel puts `DM_COOKIE` in the uevent, then blocks in
+  `dm_udev_wait()`. lvm2's `95-dm-notify.rules` is what releases it:
+
+  ```
+  ENV{DM_COOKIE}=="?*", RUN+=".../dmsetup udevcomplete $env{DM_COOKIE}"
+  ```
+
+  With no rules installed nothing ever calls `udevcomplete`, so `cryptsetup open`
+  blocks indefinitely (observed: past a 900 s timeout) even though the mapping is
+  already live in the kernel. The fingerprint is distinctive - `/sys/block/dm-0`
+  exists with the right name and `suspended=0`, `/dev/mapper` contains **only**
+  `control` (that node comes from devtmpfs, not udev), and the named node never
+  appears. `10-dm.rules`/`13-dm-disk.rules` are what create it.
+
+  `DM_DISABLE_UDEV=1` makes libdevmapper skip the handshake and create nodes
+  itself - fine for a bench script, useless in production, because
+  `systemd-cryptsetup` links the same library and would hang identically at boot.
+
+#### Kernel options required
+
+Absent from the shipped kernel; all verified sufficient by the test build:
+
+```
+BLK_DEV_DM, DM_CRYPT           # no device-mapper at all in the shipped config
+CRYPTO_XTS, CRYPTO_ESSIV       # the cipher modes themselves
+CRYPTO_USER_API, CRYPTO_USER_API_SKCIPHER   # AF_ALG; cryptsetup needs it to
+                               # check cipher availability at luksFormat time
+CRYPTO_AES_ARM                 # stock dm-crypt takes only the software path,
+                               # and the shipped kernel has NO ARM assembly
+                               # crypto at all, so its AES is aes-generic
+CRYPTO_SHA1_ARM, CRYPTO_SHA256_ARM          # cheap, same reasoning
+CRYPTO_ADIANTUM, CRYPTO_CHACHA20, CRYPTO_NHPOLY1305   # the recommended cipher
+```
+
+`drivers/md` is not in `gen-driver-modules.py`'s include list, which is why
+nothing arrived by the scoped-autoModules route.
+
+#### Recommendation
+
+LUKS is **feasible, and with the right cipher it is not even especially
+expensive**. Encrypted reads clear the 11.7 MB/s wire speed, so for a box serving
+a 100 Mb/s link the encryption stops being the limiting factor; only large local
+writes still feel it (9.1 MB/s vs 44.6 unencrypted).
+
+If it is wanted:
+
+- **`xchacha12,aes-adiantum-plain64`, 256-bit, `--sector-size 4096`.** Roughly
+  double AES-XTS on this CPU, no kernel patch, no added risk. `--sector-size
+  4096` is worth ~25% on its own and matches both ext4's block size and the
+  drives' physical sector size.
+- Take `aes-cbc-essiv:sha256` + the dm-crypt mask patch **only** if the extra
+  9 MB/s is worth reintroducing a deadlock risk upstream deliberately removed,
+  on a 95 MB box that is awkward to power-cycle. Probably not.
+- Do **not** pick a cipher from `cryptsetup benchmark` here - it measures a path
+  dm-crypt does not use.
+- `--pbkdf argon2id --pbkdf-memory 32768 --pbkdf-parallel 1`, and **verify the
+  unlock on the device**, never on the build host.
+- `services.lvm.enable = true`, plus the kernel options above.
+- Data only, not root: root stays unencrypted on the USB stick and unlocking
+  happens in ordinary userspace via systemd-cryptsetup, with no initrd
+  involvement - which sidesteps both the deprecated scripted initrd (§6.2) and
+  the systemd initrd that did not fit in RAM.
+- Headless unlock, in increasing order of effort: a keyfile on the USB boot stick
+  (protects against drive theft, not chassis theft); manual entry over serial or
+  ssh after boot; network unlock in initrd (heavy here, and moot if root is
+  unencrypted).
+
+#### 7.2.1 How this was tested, and the bench state left behind
+
+No flash write was involved. The kernel was built as the shipped
+`nixos/configuration.nix` kernel plus the options above (17 config deltas, all
+intended or `select` consequences), TFTP'd into RAM, and booted with the
+**initrd, DTB and `init=` taken from the USB stick**, so only the kernel differed:
+
+```
+tftpboot 0x00800000 zImage-luks
+tftpboot 0x02000000 ds410j.dtb
+tftpboot 0x02100000 initrd-nixos
+setenv bootargs <the APPEND line from /boot/extlinux/extlinux.conf>
+bootz 0x00800000 0x02100000:0x78fc00 0x02000000
+```
+
+A power cycle returns to the flashed image with nothing to undo. Note that the
+old kernel's module tree loaded fine into the new kernel (`zram` came up
+normally) - same version, no `MODVERSIONS`, no `MODULE_SIG`.
+
+**Disk state:** `/dev/sdb` was cleared for this work, so `kyle:data1` is gone. It
+now carries a GPT with a single 16 GiB `sdb1` formatted as empty ext4, labelled
+`ds410j-scratch`; the remaining ~2.7 TB is unallocated. **`/dev/sdc` was never
+touched** - it still holds the original DSM (sdc1 system, sdc2 swap, sdc3 data)
+kept as a reference.
 
 ### 7.3 Smaller items
 

@@ -746,6 +746,74 @@ Expect `## Booting image at 04000000`, `Load Address: 02000000`, `Verifying Chec
 ... OK`, then `## Loading Ramdisk Image at f8280000` naming the ramdisk stub with its
 own `Verifying Checksum ... OK`, then the U-Boot 2026.07 banner.
 
+## Testing a kernel change without flashing anything
+
+The cheapest way to answer "does this kernel option do what I think" on this
+board. Used for the LUKS work (PORTING.md §7.2) and reusable for anything else:
+build the shipped kernel plus your change, TFTP **only the kernel** into RAM, and
+take the initrd, DTB and `init=` off the USB stick. Nothing is written to flash
+or to the stick, and a power cycle returns to the known-good image.
+
+1. Build a variant of the real kernel. `boot.kernelPatches` with
+   `structuredExtraConfig` is the supported hook - note the attribute is
+   `structuredExtraConfig`, *not* `extraStructuredConfig`, which throws:
+
+   ```nix
+   modules = [ /src/nixos/configuration.nix ({ lib, ... }: {
+     boot.kernelPatches = [{
+       name = "my-test"; patch = null;
+       structuredExtraConfig = with lib.kernel; { DM_CRYPT = yes; };
+     }];
+   }) ];
+   ```
+   then build `eval.config.system.build.kernel`.
+
+2. **Diff the resulting config against the running one before booting it.**
+   `/proc/config.gz` is enabled on this box, so this is cheap and it is what
+   makes the boot low-risk:
+   ```sh
+   ssh root@$DS 'cat /proc/config.gz' | gunzip > running.cfg
+   diff <(sort running.cfg) <(sort $(nix-build ... .configfile)/config)
+   ```
+   Anything in that diff you did not ask for is a reason to stop.
+
+3. Copy the *device's own* initrd and DTB into `/var/lib/tftpboot`, so the only
+   variable is the kernel. Both paths are in `/boot/extlinux/extlinux.conf`:
+   ```sh
+   ssh root@$DS 'cat /boot/nixos/<hash>-initrd' > /var/lib/tftpboot/initrd-nixos
+   ssh root@$DS 'cat /boot/nixos/<hash>-dtbs/kirkwood-ds410j.dtb' > /var/lib/tftpboot/ds410j.dtb
+   ```
+
+4. Reboot and catch **our** U-Boot, not the stock one. `systemctl reboot` works
+   (the MCU restart path). The two loaders are distinguishable in the serial log:
+   stock prints `Hit any key to stop autoboot:  3  2  1  0` with no escapes, ours
+   prints the same line wrapped in `ESC[2K` erase codes and is preceded by
+   `U-Boot 2026.07 (Jul ...)`. **Do not use `spam.sh` here** - it starts spamming
+   immediately and would stop the stock loader at `Marvell>>` instead of letting
+   it chainload. Wait for our banner in the log, *then* send spaces.
+
+5. At `=>` - the env in mtd4 already has `ipaddr`/`serverip`, and
+   `kernel_addr_r`/`fdt_addr_r`/`ramdisk_addr_r` are baked into the build:
+
+   ```
+   tftpboot 0x00800000 zImage-test
+   tftpboot 0x02000000 ds410j.dtb
+   tftpboot 0x02100000 initrd-nixos
+   setenv bootargs <the APPEND line from extlinux.conf, verbatim>
+   bootz 0x00800000 0x02100000:<initrd size in hex> 0x02000000
+   ```
+
+   `bootz` is present and supports the `addr:size` raw-initrd form. Load all
+   three and check the reported byte counts *before* `bootz`; if anything looks
+   wrong, `boot` resumes the normal USB path and nothing has happened.
+
+Two things that make this safe in practice: the old kernel's module tree loads
+into the new kernel (same version, and this kernel has no `MODVERSIONS` and no
+`MODULE_SIG`, so it is a vermagic-only check), and sshd regenerates its host keys
+on every boot because `/etc` is a tmpfs - so expect the host-key warning and use
+`-o UserKnownHostsFile=/dev/null`.
+
+
 ## Iterating on U-Boot
 
 `nix-build /src/uboot` produces a raw `u-boot.bin`. Two ways to run it:

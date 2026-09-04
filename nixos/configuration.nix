@@ -274,7 +274,18 @@ in
   system.tools.nixos-option.enable = false;
   system.tools.nixos-rebuild.enable = false;
 
-  services.lvm.enable = false;
+  # NOT disabled, despite looking like an easy closure saving. lvm2 is where the
+  # device-mapper udev rules live, and without them anything using dm - LUKS
+  # above all - hangs rather than failing (PORTING.md §7.2): libdevmapper creates
+  # the mapping, then blocks in dm_udev_wait() on a cookie that only lvm2's
+  # 95-dm-notify.rules ever releases. Observed on this board past a 900 s
+  # timeout, with the mapping already live in the kernel and /dev/mapper holding
+  # nothing but `control`. nixpkgs' own option description says it outright:
+  # "The lvm2 package contains device-mapper udev rules and without those tools
+  # like cryptsetup do not fully function!"
+  #
+  # services.lvm.enable = false;
+
   # Stops openssh pulling xauth, and with it libX11/libXmu/libXt/libSM.
   programs.ssh.setXAuthLocation = false;
   boot.enableContainers = false;
