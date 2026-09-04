@@ -357,16 +357,41 @@ anything above `0x3B` as **[VERIFY]**: plausible, never tested here.
 | `0x71` | `q` | `RCPOWERON` | |
 | `0x72` | `r` | `DISABLE_SCHEDULE_POWERON` | **a lead for §3.3** (power-on after AC loss) |
 | `0x73` | `s` | `ENABLE_SCHEDULE_POWERON` | " |
-| `0x74` | `t` | `DISABLE_FANCHECK` | confirmed in use on DSM's shutdown path |
-| `0x75` | `u` | `ENABLE_FANCHECK` | the thing to try for the fan events below |
+| `0x74` | `t` | `DISABLE_FANCHECK` | **[MEASURED]** stops the alarm below; also what DSM sends on its shutdown path |
+| `0x75` | `u` | `ENABLE_FANCHECK` | **[MEASURED] do not use — see below** |
 | — | `"EC0"` | `DISABLE_CPUFANCHECK` | multi-character, unlike everything else |
 | — | `"EC1"` | `ENABLE_CPUFANCHECK` | " |
 
-**Fan failure could not be reproduced here.** Disconnecting the fans produced no
-MCU traffic at all, on two attempts. So either fan checking is off by default
-(`0x75` `u` is the thing to try) or this model's MCU does not watch the fan.
-Against the latter: the stock Marvell loader prints `Fan Status: Good` in its
-banner, so *something* on this board reads a fan sensor.
+**Fan checking is broken on this board — leave it off.** [MEASURED 2026-09-04.]
+The behaviour is the exact opposite of what it looks like:
+
+- With fan checking **off** (the default), disconnecting the fans produces no MCU
+  traffic at all — two attempts, nothing.
+- Enabling it with `0x75` `u` makes the MCU **spam `0x66` FAN_FAILURE
+  continuously with the fans running perfectly well** — 34 events before it was
+  turned off again.
+- `0x74` `t` stops it immediately, and the counter freezes.
+
+So the MCU's fan sense does not work on a DS410j, in either direction. That fits
+the hardware: the fan here is a 3-bit GPIO speed select (`gpio-fan`), not
+something the MCU drives, so it has no tacho to read and defaults to "failed".
+It also explains why DSM sends `0x74` on its shutdown path — on this model the
+check is useless and stays disabled.
+
+`0x66`/`0x67` are therefore **not** a usable fan-failure signal here. Real fan
+monitoring stays with `gpio-fan` plus the drive temperatures. The stock loader's
+`Fan Status: Good` banner is presumably reading something else, or is simply
+unconditional.
+
+**`EC1` and the guard.** `"EC0"`/`"EC1"` are the only multi-byte commands, and
+`"EC1"` used to be refused for containing a `1`. It is now exempt when written as
+an exact three-byte write — but the exemption comes with a real caveat: `send`
+transmits bytes **one at a time**, and nobody has established whether this MCU
+reassembles `E`,`C`,`1` into one token or parses byte-at-a-time. If it is the
+latter, that trailing `1` is `SHUTDOWN` and the box powers off. The driver logs a
+warning saying so before sending. Note also that a DS410j has no separate CPU fan
+(the Kirkwood is passively cooled), so `CPUFANCHECK` probably has nothing to
+enable [LIKELY] — which makes the gamble a poor trade.
 
 **Dangerous bytes, for the avoidance of doubt:** `0x31` (shutdown) and `0x70`
 (remote power off) both cut power. `ds410j-mcu.sh`'s allowlist exists precisely so

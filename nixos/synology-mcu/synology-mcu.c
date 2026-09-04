@@ -162,12 +162,15 @@
  *                             "Fan stop [UART2_CMD_CPUFAN_FAILURE]", which is
  *                             what named this whole enum for us.
  *
- * Fan failure has NOT been reproduced on this board: disconnecting the fans
- * produced no MCU traffic on two attempts. Either fan checking is off by
- * default (0x75 ENABLE_FANCHECK is the thing to try, via the debugfs send file)
- * or this model's MCU does not monitor the fan at all. Note the stock Marvell
- * loader prints "Fan Status: Good" in its banner, so something on this board
- * does read a fan sensor.
+ * FAN CHECKING IS BROKEN ON THIS BOARD - leave it off. [MEASURED 2026-09-04.]
+ * With it off (the default) disconnecting the fans produces no MCU traffic at
+ * all; enabling it with 0x75 makes the MCU spam 0x66 FAN_FAILURE continuously
+ * with the fans running fine, and 0x74 stops it again. So the MCU's fan sense
+ * does not work here in either direction, which fits the hardware - the fan is a
+ * 3-bit GPIO speed select (gpio-fan), not something the MCU drives, so it has no
+ * tacho to read and defaults to "failed". It is also why DSM sends 0x74 on its
+ * shutdown path. Real fan monitoring stays with gpio-fan and the drive
+ * temperatures; treat 0x66/0x67 as unusable on a DS410j.
  */
 
 /* host -> MCU, only the ones this driver itself emits */
@@ -451,6 +454,12 @@ static int mcu_status_amber_set(struct led_classdev *cdev,
  * exists once this driver binds the port.
  */
 
+/* the only known commands longer than one byte */
+static bool mcu_is_escape_cmd(const u8 *b, size_t n)
+{
+	return n == 3 && b[0] == 'E' && b[1] == 'C' && (b[2] == '0' || b[2] == '1');
+}
+
 static ssize_t mcu_dbg_send_write(struct file *file, const char __user *ubuf,
 				  size_t len, loff_t *ppos)
 {
@@ -469,12 +478,27 @@ static ssize_t mcu_dbg_send_write(struct file *file, const char __user *ubuf,
 	if (n && buf[n - 1] == '\n')
 		n--;
 
-	for (i = 0; i < n; i++) {
-		if (!allow_dangerous && (buf[i] == '1' || buf[i] == 'p')) {
-			dev_warn(mcu->dev,
-				 "refusing 0x%02x '%c' - powers the box off, and a soft-off DS410j needs a human at the front panel. Set the allow_dangerous module parameter if you mean it.\n",
-				 buf[i], buf[i]);
-			return -EPERM;
+	/*
+	 * "EC0"/"EC1" (enable/disable CPU fan check) are the only known
+	 * multi-character commands, and "EC1" trips a naive scan for '1'. Let
+	 * them through as an exact three-byte write rather than blocking a real
+	 * command - but say plainly what the risk is, because these bytes go out
+	 * one at a time and nobody has established whether the MCU reassembles
+	 * them or parses byte-at-a-time. If it is the latter, the trailing '1'
+	 * of "EC1" is SHUTDOWN and the box goes off.
+	 */
+	if (mcu_is_escape_cmd(buf, n)) {
+		dev_warn(mcu->dev,
+			 "sending the multi-byte command \"%c%c%c\" one byte at a time; if this MCU does not reassemble it, the trailing byte is interpreted on its own\n",
+			 buf[0], buf[1], buf[2]);
+	} else {
+		for (i = 0; i < n; i++) {
+			if (!allow_dangerous && (buf[i] == '1' || buf[i] == 'p')) {
+				dev_warn(mcu->dev,
+					 "refusing 0x%02x '%c' - powers the box off, and a soft-off DS410j needs a human at the front panel. Set the allow_dangerous module parameter if you mean it. (The multi-byte commands \"EC0\"/\"EC1\" are exempt when written on their own.)\n",
+					 buf[i], buf[i]);
+				return -EPERM;
+			}
 		}
 	}
 
