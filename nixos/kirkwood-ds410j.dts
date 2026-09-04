@@ -403,6 +403,34 @@
 };
 
 /*
+ * Delete mainline's stand-alone power-off node.
+ *
+ * kirkwood-synology.dtsi declares poweroff@12100 with compatible
+ * "synology,power-off" for drivers/power/reset/qnap-poweroff.c, which maps the
+ * UART registers itself and writes '1'. It works, but it is a second node at
+ * the same unit address as serial@12100, which is what makes dtc warn:
+ *
+ *   /ocp@f1000000/serial@12100: duplicate unit-address
+ *       (also used in node /ocp@f1000000/poweroff@12100)
+ *
+ * Now that synology-mcu owns this MCU it should own power-off too, rather than
+ * leaving half the channel to another driver through a duplicate node. The
+ * driver registers a SYS_OFF_MODE_POWER_OFF handler that pokes the UART
+ * directly, exactly as qnap-poweroff did.
+ *
+ * CONSEQUENCE, and it is worth stating plainly: with this node gone, if
+ * synology-mcu does not load then nothing can cut the board's power.
+ * "systemctl poweroff" would halt the kernel with the box still running. That
+ * is recoverable - pull the plug - but it is a real regression if the module
+ * ever fails to build or bind.
+ */
+/ {
+	ocp@f1000000 {
+		/delete-node/ poweroff@12100;
+	};
+};
+
+/*
  * The board microcontroller, as a serdev client rather than a bare tty.
  *
  * UART1 is already enabled by kirkwood-synology.dtsi (and mainline's

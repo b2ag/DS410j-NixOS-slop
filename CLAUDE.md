@@ -150,7 +150,9 @@ device with no software recovery path:
   known-good stock configuration.
 - A modern U-Boot is chainloaded from the stock U-Boot into the freed `zImage` slot; it
   never replaces the stock loader. Verified working in RAM (`PORTING.md` §5.1).
-- **Warm reboot does not work** — neither Linux nor U-Boot 2026.07 can reset this SoC.
+- **Warm reboot does not work *yet*** — neither Linux nor U-Boot 2026.07 can reset
+  this SoC, but **DSM reboots this board successfully**, so a mechanism exists and
+  we have not found it. Do not treat it as impossible.
   A power cycle is still required, but the box **powers itself on when AC is
   restored**, and a remote outlet is now wired and verified
   (`kernel/ds410j-power.sh`). What enabled that behaviour is unknown (§3.3) - do

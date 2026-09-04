@@ -308,7 +308,15 @@ the shutdown as intentional - and `7` (status LED off) at the end, next to
 but our shutdown never sends it and the box still stayed off across an AC cycle,
 so it is not that. `t` remains unidentified and is now less likely to be
 power-related.
-**Warm reboot does not work.** `systemctl reboot` completes the entire shutdown —
+**Warm reboot does not work yet — but DSM does it, so it is possible.** Stock DSM
+offers a reboot and it works on this hardware, which means the board has a
+mechanism we have not identified. Treat every "cannot reset this SoC" statement
+below as "we have not found how", not as a hardware limit. Now that the MCU
+protocol is largely mapped and `nixos/synology-mcu` already owns the UART and a
+sys-off handler, that driver is the natural place to put a restart handler once
+the command is known.
+
+`systemctl reboot` completes the entire shutdown —
 unmounts, swaps off, SCSI caches flushed — and then hangs at
 `reboot: Restarting system`. Neither Linux nor U-Boot 2026.07 can reset this SoC;
 the *stock* loader can, so the hardware path exists and mainline does not reach it.
@@ -875,8 +883,9 @@ are recorded so nobody re-runs them:
 userspace daemon — in kernel space the bytes become real input events, so a
 power-button hold arrives as `KEY_POWER` and logind applies its ordinary policy
 with nothing holding a tty. `0x61` becomes `KEY_RESTART` rather than an actual
-reboot, because warm reboot does not work on this SoC (§7.3), so the policy
-belongs in userspace. Fan-failure bytes are logged at `dev_crit`.
+reboot, because warm reboot is not solved yet (§3.3) — DSM manages it, so the
+mechanism exists and is simply unknown — and until it is, the policy belongs in
+userspace. Fan-failure bytes are logged at `dev_crit`.
 
 Built and verified on the bench, **not yet flashed**: the module cross-compiles
 warning-free with `vermagic 6.12.104 ... ARMv5` and the DT alias
@@ -889,12 +898,19 @@ driver":
 - **`/dev/ttyS1` stops existing.** A serdev client owns its port. `ds410j-mcu.sh`
   now writes to the driver's debugfs `send` file and only falls back to the
   character device, so `mcu-panel.nix` and the fan daemon are unaffected.
-- **Power-off is untouched**, because it never used the tty: mainline's
-  `qnap-poweroff` (`CONFIG_POWER_RESET_QNAP=y`) binds the separate
-  `synology,power-off` node in `kirkwood-synology.dtsi`, ioremaps the same
-  registers and polls out `1` on its own. Deliberately *not* duplicated in the
-  driver: an accidentally broken power-off is the one failure that strands the
-  box.
+- **Power-off moved into the driver.** `kirkwood-synology.dtsi`'s stand-alone
+  `poweroff@12100` node (for mainline's `qnap-poweroff`) sat at the same unit
+  address as `serial@12100`, which is what made `dtc` warn about a duplicate.
+  The DTS now deletes that node and `synology-mcu` registers its own
+  `SYS_OFF_MODE_POWER_OFF` handler, which pokes the UART registers directly
+  rather than going through serdev — a power-off handler runs after
+  `device_shutdown()` and possibly with interrupts off, so the tty layer is not
+  available and nothing may sleep. Same register sequence as `qnap-poweroff.c`;
+  `of_iomap()` maps without requesting the region, so it does not collide with
+  the 8250. **Consequence: if the module does not load, nothing can cut the
+  board's power** — `systemctl poweroff` would halt with the box still running.
+  Recoverable by pulling the plug, but a real regression if it ever fails to
+  bind.
 
 Unrelated loose end noticed on the way: **MPP6** is `MUX UNCLAIMED` in Linux so it
 keeps whatever U-Boot left, and `CONFIG_STRICT_DEVMEM=y` blocks `/dev/mem`.

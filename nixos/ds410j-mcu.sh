@@ -13,7 +13,7 @@
 # SAFETY: this helper accepts only the codes above. It will not send '1', which
 # powers the box off, nor 't', which is unidentified and appears in DSM's
 # shutdown path. Nothing running as a system service should be able to cut power
-# by getting a character wrong, and a warm reboot does not work on this board
+# by getting a character wrong, and warm reboot is not solved yet on this board
 # (PORTING.md 3.3) - an accidental poweroff needs a human at the front panel.
 set -u
 

@@ -19,15 +19,30 @@
  * threshold is in MCU firmware; there is no short-press event to react to and
  * no way to add one.
  *
+ * POWER OFF is ours too. kirkwood-synology.dtsi declares a separate
+ * "synology,power-off" node over the same registers for mainline's
+ * drivers/power/reset/qnap-poweroff.c, and two nodes at 12100 is what makes dtc
+ * warn about a duplicate unit address. kirkwood-ds410j.dts deletes that node, so
+ * this driver has to provide the power-off handler - if it does not load, the
+ * box has no way to cut its own power.
+ *
+ * The handler does NOT go through serdev. By the time a power-off handler runs,
+ * device_shutdown() has already been round the tree and the call may happen with
+ * interrupts disabled, so the tty layer is not available and nothing may sleep.
+ * It therefore reprograms the UART from scratch through a direct mapping and
+ * writes the byte itself - the same approach, and the same register sequence, as
+ * qnap-poweroff.c. of_iomap() on the parent's reg is deliberate: it maps without
+ * requesting the region, so it does not collide with the 8250 that owns the port
+ * (which is exactly how the mainline driver coexists with it today).
+ *
  * What this driver deliberately does NOT do:
  *
- *   Power off.  Mainline's drivers/power/reset/qnap-poweroff.c already handles
- *   it: kirkwood-synology.dtsi declares a "synology,power-off" node, the driver
- *   ioremaps the UART registers itself and polls out '1' at 9600 without going
- *   near the tty layer, and CONFIG_POWER_RESET_QNAP=y in our kernel. Adding a
- *   second power-off path here would be redundant and would risk the one
- *   operation that most needs to keep working - a soft-off box cannot be
- *   revived remotely, it needs a human at the front panel.
+ *   Reboot.  Warm reboot is not solved on this board YET - DSM offers a reboot
+ *   and it works, so a mechanism exists and we have not found it (PORTING.md
+ *   3.3). Whatever it turns out to be, this driver is the natural home for it:
+ *   the UART mapping and a sys-off handler are already here, so a restart
+ *   handler would be a few lines once the command is known. Until then 0x61
+ *   becomes KEY_RESTART and userspace decides.
  *
  *   Blink.  The lamps are exposed as plain on/off LED class devices using
  *   brightness_set_blocking, which is the callback that is guaranteed to be
@@ -38,9 +53,11 @@
  * Binding: "synology,ds410j-mcu" is a local compatible, not an upstream one.
  */
 
+#include <linux/clk.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/input.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/leds.h>
@@ -48,8 +65,11 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/reboot.h>
 #include <linux/seq_file.h>
 #include <linux/serdev.h>
+#include <linux/serial_reg.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
@@ -86,8 +106,9 @@
  *
  * Host -> MCU
  *
- *   0x31 '1'  SHUTDOWN               [MEASURED] cuts power. See note above:
- *                                    qnap-poweroff owns this, not us.
+ *   0x31 '1'  SHUTDOWN               [MEASURED] cuts power. This driver's
+ *                                    power-off handler sends it; the debugfs
+ *                                    send file refuses it by default.
  *   0x32 '2'  BUZZER_SHORT           [MEASURED]
  *   0x33 '3'  BUZZER_LONG            [MEASURED]
  *   0x34 '4'  LED_POWER_ON           [MEASURED] steady
@@ -150,6 +171,7 @@
  */
 
 /* host -> MCU, only the ones this driver itself emits */
+#define MCU_CMD_SHUTDOWN	'1'
 #define MCU_CMD_LED_POWER_ON	'4'
 #define MCU_CMD_LED_POWER_OFF	'6'
 #define MCU_CMD_LED_HD_OFF	'7'
@@ -194,6 +216,10 @@ struct syno_mcu {
 	/* serialises writes to the MCU, and the status-lamp arbitration */
 	struct mutex		lock;
 	enum status_colour	status;
+
+	/* direct UART mapping, used only by the power-off handler */
+	void __iomem		*uart;
+	unsigned int		divisor;
 
 	spinlock_t		rx_lock;
 	struct mcu_rx_entry	rx_ring[RX_RING_LEN];
@@ -525,6 +551,60 @@ static int mcu_dbg_counters_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(mcu_dbg_counters);
 
+/* ----------------------------------------------------------- power off --- */
+
+/*
+ * Runs late, possibly with interrupts disabled and certainly after
+ * device_shutdown(), so: no serdev, no sleeping, no tty. Reprogram the port and
+ * push the byte out by hand. Lifted in spirit and in register order from
+ * mainline's qnap-poweroff.c, whose DT node kirkwood-ds410j.dts deletes in
+ * favour of this.
+ */
+static int mcu_power_off(struct sys_off_data *data)
+{
+	struct syno_mcu *mcu = data->cb_data;
+	void __iomem *base = mcu->uart;
+
+	writel(UART_LCR_DLAB | UART_LCR_WLEN8, base + (UART_LCR << 2));
+	writel(mcu->divisor & 0xff, base + (UART_DLL << 2));
+	writel((mcu->divisor >> 8) & 0xff, base + (UART_DLM << 2));
+	writel(UART_LCR_WLEN8, base + (UART_LCR << 2));
+	writel(0, base + (UART_IER << 2));
+	writel(0, base + (UART_FCR << 2));
+	writel(0, base + (UART_MCR << 2));
+
+	writel(MCU_CMD_SHUTDOWN, base + (UART_TX << 2));
+
+	return NOTIFY_DONE;
+}
+
+static int mcu_setup_power_off(struct syno_mcu *mcu, u32 baud)
+{
+	struct device_node *np = mcu->dev->parent->of_node;
+	unsigned long tclk;
+	struct clk *clk;
+
+	mcu->uart = of_iomap(np, 0);
+	if (!mcu->uart)
+		return dev_err_probe(mcu->dev, -ENOMEM,
+				     "cannot map the UART for power-off\n");
+
+	clk = of_clk_get(np, 0);
+	if (IS_ERR(clk)) {
+		iounmap(mcu->uart);
+		return dev_err_probe(mcu->dev, PTR_ERR(clk),
+				     "no UART clock, cannot compute the divisor\n");
+	}
+	tclk = clk_get_rate(clk);
+	clk_put(clk);
+
+	mcu->divisor = DIV_ROUND_CLOSEST(tclk, 16 * baud);
+
+	return devm_register_sys_off_handler(mcu->dev, SYS_OFF_MODE_POWER_OFF,
+					     SYS_OFF_PRIO_DEFAULT,
+					     mcu_power_off, mcu);
+}
+
 /* --------------------------------------------------------------- probe --- */
 
 static int mcu_register_leds(struct syno_mcu *mcu)
@@ -604,6 +684,10 @@ static int mcu_probe(struct serdev_device *serdev)
 	if (ret)
 		return ret;
 
+	ret = mcu_setup_power_off(mcu, baud);
+	if (ret)
+		return ret;
+
 	mcu->debugfs = debugfs_create_dir(DRV_NAME, NULL);
 	debugfs_create_file("send", 0200, mcu->debugfs, mcu,
 			    &mcu_dbg_send_fops);
@@ -612,7 +696,7 @@ static int mcu_probe(struct serdev_device *serdev)
 			    &mcu_dbg_counters_fops);
 
 	dev_info(dev,
-		 "Synology DS410j MCU at %u 8N1; power button reports only on a ~4s hold\n",
+		 "Synology DS410j MCU at %u 8N1, power-off owned here; power button reports only on a ~4s hold\n",
 		 baud);
 	return 0;
 }
@@ -622,6 +706,8 @@ static void mcu_remove(struct serdev_device *serdev)
 	struct syno_mcu *mcu = serdev_device_get_drvdata(serdev);
 
 	debugfs_remove_recursive(mcu->debugfs);
+	if (mcu->uart)
+		iounmap(mcu->uart);
 }
 
 static const struct of_device_id mcu_of_match[] = {

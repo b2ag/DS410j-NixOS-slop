@@ -270,10 +270,17 @@ things follow, and both are already handled:
 
 - `ds410j-mcu.sh` writes to the driver's debugfs file first and only falls back
   to `/dev/ttyS1`, so `mcu-panel.nix` and the fan daemon are unaffected.
-- **Power-off is untouched.** It never used the tty: mainline's `qnap-poweroff`
-  binds the separate `synology,power-off` node over the same registers and polls
-  out `1` itself. `dtc` even warns about the shared unit address, which is how
-  you can see the two nodes coexisting.
+- **Power-off is the driver's job now.** It used to belong to mainline's
+  `qnap-poweroff`, via a stand-alone `poweroff@12100` node in
+  `kirkwood-synology.dtsi` — a second node at the same unit address as
+  `serial@12100`, which is what made `dtc` warn about a duplicate. Our DTS
+  deletes that node and the driver registers its own power-off handler.
+  It writes the UART registers directly rather than using serdev, because a
+  power-off handler runs after `device_shutdown()` and may be called with
+  interrupts disabled: no tty, no sleeping. Same register sequence as
+  `qnap-poweroff.c`. **If the module does not load, nothing cuts the board's
+  power** — `systemctl poweroff` halts with the box still running. Recoverable
+  by pulling the plug, but worth knowing.
 
 What it gives you:
 
@@ -597,7 +604,8 @@ a box in a cupboard.
    is 3 s. Starting the spammer after `sercmd.sh` returns is already too late, and the
    board autoboots into stock DSM.
 
-4. **Warm reboot does not work** (PORTING.md §3.3). Neither Linux nor U-Boot 2026.07 can
+4. **Warm reboot does not work yet** — but DSM reboots this board, so the
+   mechanism exists and is merely unknown (PORTING.md §3.3). Neither Linux nor U-Boot 2026.07 can
    reset this SoC; both hang. **Every reset needs a human to power cycle.** Budget for
    it - you cannot iterate unattended.
 
