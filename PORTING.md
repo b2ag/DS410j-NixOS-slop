@@ -69,11 +69,13 @@ down; this list exists so they are not lost.
    USB passthrough is a plausible source of timing trouble for a protocol with a
    short handshake window. Worth answering because it re-grades §0.
 
-2. **What set power-on-at-AC-restore — UNKNOWN.** (§3.3) The behaviour changed and
-   the change is real; the cause is not known and the MCU is only one guess among
-   several. It is useful and we would not want to undo it by accident, but we can
-   neither reproduce it deliberately nor reverse it.
-
+2. **Power-on after AC loss — WORKING THEORY, not settled.** (§3.3)
+   restore-last-power-state: cut AC on a running box and it comes back (4/4);
+   cut AC on a soft-off box and it stays off (1/1). Small sample, one evening,
+   one hardware state. The `q`/`w` MCU guess is **withdrawn** - the behaviour
+   predates it - and so is "booting DSM cleared the setting", which was really
+   just DSM leaving the box soft-off. Practical rule: `poweroff` is the command
+   that strands the box, not the outlet.
 3. **The power button does not work, and finding it is the top priority.** (§7.1)
    DSM shuts the box down on a short press, so a mechanism exists. The stock
    loader's own pinmux has now been read (§7.1, "The stock loader's pinmux"),
@@ -250,47 +252,46 @@ The `gpio-fan` node already carries `#cooling-cells = <2>`, so a device-tree
 thermal zone binding the two is now possible - see §7.1.
 
 
-**THE BOX NOW POWERS ON BY ITSELF WHEN AC RETURNS** (2026-09-03). It previously
-needed a front-panel button press after every power cut; it no longer does.
+**POWER-ON AFTER AC LOSS — WORKING THEORY, SMALL SAMPLE.** The box comes back by
+itself when mains returns, but only from some states. The theory that currently
+fits every observation is **restore-last-power-state**:
 
-**Reproducible on demand** [CONFIRMED]: a deliberate remote cycle via
-`kernel/ds410j-power.sh` switched the outlet off (carrier 1 -> 0 in 2 s), waited
-10 s, switched it back on (carrier 0 -> 1 in 4 s), and the box booted to a login
-prompt with nobody touching it. **The cause, however, is still completely
-unknown** [VERIFY].
+| state when AC was cut | AC restored | came back? | trials |
+|---|---|---|---|
+| running | yes | **yes** | 4 |
+| soft-off (`poweroff`, or DSM shutdown) | yes | **no** | 1 |
 
-Do not assume the MCU did it. Unmapped characters had been sent to the MCU around
-that time and `q`/`w` were floated as a guess, but that is a guess and nothing
-more — the bench log lived in `/root/mcu-map.txt`, which is a tmpfs on this image,
-so the record was erased at the next reboot. Other explanations are equally open
-and none has been ruled out:
+That is standard power-recovery behaviour and needs no configurable setting: the
+MCU tracks whether the system is on or off, and restores it. A raw AC cut leaves
+the remembered state at "on"; a deliberate power-off leaves it at "off".
 
-- it may always have behaved this way under some conditions, and the earlier
-  "needs a button press" attempts differed in a way nobody recorded;
-- the remote socket may switch AC differently from pulling the plug;
-- something in our own boot chain or in the stock U-Boot environment (mtd4);
-- an MCU character, known or unknown;
-- the kwboot attempts, which drove the UART during power-up.
+**Treat this as a working theory, not a finding.** Four trials one way and one
+the other is a small sample, and every trial so far was on the same evening with
+the same hardware state. It has not been tested across, for example, a long
+power-off, a different starting uptime, or after the box has been off for hours.
 
-What *is* established is only that the behaviour changed. Reproducing it
-deliberately, or reversing it, is unsolved.
+Two earlier claims are **withdrawn**:
 
-One thing follows, and it is worth having regardless of the cause.
+- *"Sending `q`/`w` to the MCU enabled it."* No demonstrated effect. The
+  behaviour was already working from a running box at 22:59 and 23:26, and `q`
+  was not sent until 23:50. `w` was never sent at all. The guess was reasonable
+  and the record that would have settled it was lost to a tmpfs, but the
+  timeline now rules it out as the cause.
+- *"Booting stock DSM cleared the setting."* Almost certainly wrong. DSM did not
+  reset anything - it shut the box down, leaving it soft-off, and the next AC
+  cycle then correctly left it off. No setting changed.
 
-**It makes remote power cycling possible, which changes the operating model.**
-"Warm reboot does not work, so every reset needs a human at the button" has
-constrained this project throughout — it is why iteration is slow and why a bad
-image strands the box. With power-on-at-AC-restore, a remote-controlled mains
-socket is a complete remote power cycle. That is a better answer than either
-outstanding warm-reboot lead (an MCU reset character, or RTC auto-power-on), and
-it is wired and working - see `OPERATIONS.md`, "Remote power control". Since we
-still cannot explain why it started, `ds410j-power.sh` treats "off" as the
-dangerous direction: `cycle` always ends by trying to switch ON.
-
-Note what this does NOT establish. It is tempting to conclude the state lives in
-the MCU and therefore that the MCU holds non-volatile settings — but that only
-follows if an MCU character caused it, which is exactly what is unknown. Where
-this setting lives is as open as what set it.
+**What the MCU does on shutdown** [CONFIRMED]. Mainline's `qnap-poweroff.c` sends
+the single character `1` at 9600 baud, poking UART1's TX register directly rather
+than going through a tty (which is why MCU power-offs never appear in the `tx:`
+counter). That one character is sufficient: our `systemctl poweroff` sends
+nothing else and the box goes down. DSM additionally sends `t` early in
+`syno_poweroff_task` - beside `/bin/touch /var/.NormalShutdown`, where it marks
+the shutdown as intentional - and `7` (status LED off) at the end, next to
+`SynoBiosUninit`. `t` therefore *looked* like a "latch the off state" command,
+but our shutdown never sends it and the box still stayed off across an AC cycle,
+so it is not that. `t` remains unidentified and is now less likely to be
+power-related.
 **Warm reboot does not work.** `systemctl reboot` completes the entire shutdown —
 unmounts, swaps off, SCSI caches flushed — and then hangs at
 `reboot: Restarting system`. Neither Linux nor U-Boot 2026.07 can reset this SoC;

@@ -191,11 +191,20 @@ which the host listens for whole lines.
 /src/kernel/ds410j-power.sh on
 ```
 
-**Only `cycle` and `on` are ever safe to walk away from.** This works at all
-because the box powers itself on when AC returns (§3.3); that behaviour is not
-understood, so `cycle` always ends by trying to switch ON and shouts loudly if it
-cannot. Leaving the box off is the one outcome that needs a human.
+**The dangerous command is `poweroff`, not the outlet.** This is the opposite of
+what it looks like, so it is worth stating plainly:
 
+- **`cycle` from a running box is safe.** Cutting AC and restoring it brings the
+  box back on its own - four for four so far. This is the working theory in
+  PORTING.md §3.3 (restore-last-power-state), not a guarantee; the sample is
+  small.
+- **A soft-off box cannot be recovered remotely at all.** `systemctl poweroff`,
+  or DSM shutting down, leaves the MCU remembering "off". Cycling the outlet then
+  does nothing - the relay clicks and no LEDs come on. Only the front-panel
+  button revives it.
+
+So the one action that guarantees needing a human is issuing `poweroff` over ssh.
+The outlet is not the hazard; the soft power-off is.
 Three properties worth knowing before touching it:
 
 1. **The radio reaches every outlet in the owner's home.** The address

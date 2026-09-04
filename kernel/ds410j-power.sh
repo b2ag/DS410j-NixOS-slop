@@ -61,12 +61,19 @@ wait_carrier() {
   return 1
 }
 
-# ensure <on|off> - transmit and verify, retrying a flaky radio
+# ensure <on|off> [always] - transmit and verify, retrying a flaky radio
+#
+# "always" skips the already-in-that-state shortcut. That matters for the OFF
+# step of a cycle: carrier 0 does NOT mean the outlet is off. The box can soft
+# power itself off (DSM shutdown, or `poweroff`) while the outlet stays live, and
+# in that state the shortcut would skip the transmit entirely - so AC is never
+# removed, power-on-at-AC-restore never triggers, and `cycle` returns success
+# having done nothing at all while the box stays dark.
 ensure() {
-  local what=$1 want timeout
+  local what=$1 always=${2:-} want timeout
   if [ "$what" = on ]; then want=1; timeout=$ON_TIMEOUT; else want=0; timeout=$OFF_TIMEOUT; fi
 
-  if [ "$(carrier)" = "$want" ]; then
+  if [ -z "$always" ] && [ "$(carrier)" = "$want" ]; then
     say "already $what (carrier=$want)"
     return 0
   fi
@@ -88,7 +95,7 @@ ensure() {
 cycle() {
   local off_secs=${1:-10}
   say "=== cycle: off, ${off_secs}s, on ==="
-  if ! ensure off; then
+  if ! ensure off always; then
     say "could not switch off; leaving the box alone rather than guessing"
     return 1
   fi

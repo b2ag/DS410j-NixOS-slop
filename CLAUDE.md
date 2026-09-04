@@ -27,19 +27,19 @@ regression test. Amber is the only colour an empty bay can show.
 
 **Two things are parked mid-investigation** and are listed at the top of
 `PORTING.md` under "Unfinished, and easy to forget". The live one is **the power
-button**: DSM shuts the box down on a short press, we cannot see it, and the best
-untried step is reading the *stock* loader MPP config at the `Marvell>>` prompt.
-The others are the inconclusive **kwboot** test and **what set
-power-on-at-AC-restore**. Read that list before starting anything new.
+button**: DSM shuts the box down on a short press and we still cannot see it. The
+stock loader MPP config has now been read, narrowing the candidates to MPP29, 44
+and 45. The others are the inconclusive **kwboot** test and the
+restore-last-power-state theory. Read that list before starting anything new.
 
-**The box can now be power-cycled remotely** - `kernel/ds410j-power.sh cycle`,
-verified end to end. "Every reset needs a human at the button" is no longer true,
-and that was a load-bearing constraint on how this project iterates. Two caveats
-that matter: the 433 MHz radio reaches **every outlet in the house** (the address
-is hardcoded, never parameterise it), and why AC-restore power-on started is
-still unknown (§3.3), so `off` is the dangerous direction - `cycle` always ends
-by trying to switch ON. It does not help with flashing the USB stick, so a bad
-image still strands the box.
+**The box can be power-cycled remotely** - `kernel/ds410j-power.sh cycle`. Working
+theory (§3.3, small sample): the MCU restores the last power state, so cutting AC
+on a **running** box brings it back, but a **soft-off** box stays off and only the
+front-panel button revives it. So the command that strands the box is
+`systemctl poweroff`, not the outlet - never issue it remotely. Also: the 433 MHz
+radio reaches **every outlet in the house**, so the address in
+`ds410j-power.sh` is hardcoded and must never be parameterised. None of this
+helps with flashing the USB stick, so a bad image still needs a human.
 
 **The board MCU is a mapped command channel** (`/dev/ttyS1`, 9600 8N1, single ASCII
 characters). `0x31`-`0x3B` is fully mapped: `1` power off, `2`/`3` beep, `4`/`5`/`6`
