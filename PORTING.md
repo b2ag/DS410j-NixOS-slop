@@ -69,22 +69,29 @@ down; this list exists so they are not lost.
    USB passthrough is a plausible source of timing trouble for a protocol with a
    short handshake window. Worth answering because it re-grades §0.
 
-2. **Power-on after AC loss — WORKING THEORY, not settled.** (§3.3)
-   restore-last-power-state: cut AC on a running box and it comes back (4/4);
-   cut AC on a soft-off box and it stays off (1/1). Small sample, one evening,
-   one hardware state. The `q`/`w` MCU guess is **withdrawn** - the behaviour
-   predates it - and so is "booting DSM cleared the setting", which was really
-   just DSM leaving the box soft-off. Practical rule: `poweroff` is the command
-   that strands the box, not the outlet.
+2. **Power-on after AC loss — WORKING THEORY NOW HAS A COUNTER-EXAMPLE.** (§3.3)
+   restore-last-power-state predicted that cutting AC on a **running** box always
+   brings it back (it had 4/4). On **2026-09-04 that failed**: AC was cut on a
+   running NixOS box and it did **not** come back — the owner had to press the
+   front-panel button. So the tally is 4 yes / 1 no from the *same* starting
+   state, and the theory does not fit every observation any more.
+   **Operational consequence: a remote `ds410j-power.sh cycle` is NOT guaranteed
+   to bring the box back. Do not plan unattended work around it.**
+   One possibly relevant difference in the failing trial: that boot had itself
+   been started by a **button press** after a DSM soft-off, rather than by an AC
+   restore. [VERIFY] whether "how this boot was started" is what the MCU actually
+   remembers.
 
-3. **The power button does not work, and finding it is the top priority.** (§7.1)
-   DSM shuts the box down on a short press, so a mechanism exists. The stock
-   loader's own pinmux has now been read (§7.1, "The stock loader's pinmux"),
-   which narrowed the candidates from fourteen to **three: MPP29, 44 and 45**.
-   Every other GPIO on real DS410j hardware is either tested-and-negative or
-   accounted for as the fan or the bay LEDs. Those three are drive-power enables,
-   so test them **with the bays empty**, or under a stock DSM kernel where the
-   buttons demonstrably work.
+3. **The power button is SOLVED, and it works on our kernel.**
+   [CONFIRMED on hardware 2026-09-04, §7.1.] **Holding** the front-panel power
+   button for **~4 seconds** makes the board MCU transmit **one byte, `0x30`
+   (ASCII `'0'`)**, on UART1 (`/dev/ttyS1`, 9600 8N1). **A short press sends
+   nothing** — that is why the button looked invisible for so long, since every
+   test press had been a tap. No GPIO pin moves at all; the whole GPIO search was
+   looking in the wrong place. Verified on unmodified NixOS: four holds gave
+   `rx:4` with the ttyS1 IRQ count rising in step.
+   The reader is written — `nixos/synology-mcu/`, a serdev kernel driver that
+   emits `KEY_POWER`. Built and verified, not yet flashed (§7.1).
 
 Everything else outstanding is in §7.
 ---
@@ -260,13 +267,21 @@ fits every observation is **restore-last-power-state**:
 | state when AC was cut | AC restored | came back? | trials |
 |---|---|---|---|
 | running | yes | **yes** | 4 |
+| running | yes | **NO** | **1** (2026-09-04) |
 | soft-off (`poweroff`, or DSM shutdown) | yes | **no** | 1 |
 
 That is standard power-recovery behaviour and needs no configurable setting: the
 MCU tracks whether the system is on or off, and restores it. A raw AC cut leaves
 the remembered state at "on"; a deliberate power-off leaves it at "off".
 
-**Treat this as a working theory, not a finding.** Four trials one way and one
+**The theory is now contradicted, not merely unproven.** On 2026-09-04 a running
+box was cut and stayed off until a human pressed the button — same starting state
+as the four successes. Whatever the MCU remembers, it is not simply "was the
+system on". A candidate distinction, untested: in the failing trial the running
+system had been started **by a button press** after a soft-off, whereas the
+successful trials followed boots that were themselves started by an AC restore.
+
+Four trials one way and one
 the other is a small sample, and every trial so far was on the same evening with
 the same hardware state. It has not been tested across, for example, a long
 power-off, a different starting uptime, or after the box has been off for hours.
@@ -772,10 +787,131 @@ partition 2 shows the `FDT` line (`OPERATIONS.md`).
   avenue is that the same MCU accepts a reset command — worth tracing what the
   Synology variant of `POWER_RESET_QNAP` does [VERIFY]. For a headless 24/7 NAS
   this matters as much as poweroff did.
-- **The front-panel buttons are still not visible to software** [CONFIRMED for
-  everything tested; one gap remains, below]. DSM shuts this box down cleanly on
-  a short press [CONFIRMED by the owner, twice], so a mechanism exists. We have
-  not found it.
+#### The power button: SOLVED — the MCU sends `0x30` on UART1
+
+[CONFIRMED on hardware, 2026-09-04.] **The front-panel buttons are not GPIOs.**
+Pressing one makes the board MCU transmit **exactly one byte on UART1**
+(`/dev/ttyS1`, 9600 8N1): **`0x30` (ASCII `'0'`) for the front-panel power
+button, `0x61` (ASCII `'a'`) for the rear reset button.** Nothing else on the SoC
+moves. A short press and a ~5 s hold produce the same single byte, so the MCU
+reports the press and not its duration. Everything below this subsection is the record of the GPIO search that
+looked in the wrong place; it is kept because its *exclusions* are still valid
+and were what finally forced the question elsewhere.
+
+How it was established, booting the backed-up stock DSM (kernel `flash-backup/
+mtd1.bin` + ramdisk `mtd2.bin`) over TFTP into RAM, with nothing written to
+flash:
+
+1. **At the `Marvell>>` prompt, no pin moves.** Both GPIO banks were polled ~1 Hz
+   (`md 0xF1010100 8` / `md 0xF1010140 8`) across several presses and a hold.
+   Neither `datain` word changed and neither edge-latching `cause` word changed.
+   This promotes the old behavioural note ("the button does nothing at the
+   Marvell prompt") to electrical evidence.
+2. **DSM changes exactly one pinmux register in the whole SoC, and it is not a
+   button.** Diffing DSM's registers against the U-Boot baseline: `MPP_CTRL0`
+   goes `00002222` -> `01002222`, i.e. **MPP6 sel 0 -> sel 1**. Every other MPP
+   word is identical, no GPIO `ioconf` bit changes, and the GPIO interrupt masks
+   are `0` in both — **DSM never enables a single GPIO interrupt.** The only
+   `out`/`datain` differences are the fan speed and the bay LEDs.
+3. **`scemd` is the sole owner of the MCU.** `/proc/<pid>/fd` shows PID 4634
+   (`scemd`) holding `/dev/ttyS1` *and* `/dev/synobios` (twice), and nothing else
+   holds either.
+4. **`synobios.ko` has no button code.** The module was extracted from the stock
+   ramdisk and its 471-entry symbol table parsed: it has `GetGpioPin`,
+   `SetGpioPin`, `RegisterGpioIRQ`, but no button/key symbol of any kind. This is
+   also why the earlier search of the DSM *kernel image* found nothing — the
+   board logic is in a module, not the image.
+5. **The decisive test: freeze `scemd`, then press.** `kill -STOP 4634` (safe and
+   reversible; its parent is init, so it cannot respawn), then press the button:
+   **the box does not power off**, and the UART1 counter in
+   `/proc/tty/driver/serial` goes `rx:0` -> `rx:1`. Reading the port from a second
+   process yields the pending byte: `30`. A second press gives another `30`
+   (`rx:2`). So the MCU reports the press and `scemd` is what acts on it.
+
+Two things follow that matter beyond the button:
+
+- **`0x30` extends the MCU map downward.** `0x31`-`0x3B` were already mapped as
+  host->MCU commands; `0x30` is the first known **MCU->host** message. The channel
+  is bidirectional after all, which also revives the MCU as the lead for warm
+  reboot (§7.3).
+- **MPP6 = `sysrst`/`out` is a live lead for warm reboot.** MPP6 has *no* selector
+  `0x0` in `pinctrl-kirkwood.c` (verified against mainline: `0x1` = `sysrst out`,
+  `0x2` = `spi mosi`, `0x3` = `ptp trig`), so the stock loader leaves MPP6 in an
+  **invalid** mux setting and DSM is the only thing that ever sets it to
+  `sysrst out`. A SoC whose reset output is not muxed out is a plausible reason
+  `orion_wdt`'s restart handler has no effect. [LIKELY] — not yet tested.
+
+**RESOLVED: `rx:0` was our own test method.** [CONFIRMED on hardware
+2026-09-04.] The MCU only emits on a **~4 second hold**; a short press puts
+nothing on the wire. Every test press on our kernel had been a short tap, so the
+UART correctly reported `rx:0`. Holding the button properly, on unmodified NixOS,
+gives `rx:4` after four holds with the ttyS1 IRQ count rising in step
+(`29: ... 34 Edge ttyS1`, 3 -> 7). **The button works on our kernel and always
+did.**
+
+Three hypotheses were chased before the real one and all three were wrong; they
+are recorded so nobody re-runs them:
+
+- **The pinmux is NOT the cause.**
+  `/sys/kernel/debug/pinctrl/f1010000.pin-controller/pinmux-pins` reports
+  `pin 13 ... function uart1 group mpp13` and `pin 14 ... function uart1 group
+  mpp14`, both claimed by `f1012100.serial`. Our U-Boot's `ds109` board file also
+  sets `MPP13_UART1_TXD` / `MPP14_UART1_RXD` explicitly (checked against
+  `board/Synology/ds109/ds109.c` upstream).
+- **No "arming" command exists.** DSM sends nothing the MCU needs first.
+- **A held-open port is necessary but was never the missing piece.** It is still
+  a real requirement for any reader, for the reason below: On a freshly
+  booted NixOS the counters read `tx:3 rx:0` and no process has the port open —
+  `mcu-panel.nix` opens it, writes its lamp bytes and closes. An 8250 only enables
+  its receiver while the port is open, so a press with nothing holding it would be
+  dropped on the floor and never counted. DSM by contrast has `scemd` holding the
+  port open permanently. This would explain `rx:0` completely, with no arming
+  needed.
+  an 8250 enables its receiver only while the port is open, and nothing on our
+  system holds `/dev/ttyS1` open by default — `mcu-panel.nix` opens it, writes
+  its lamp bytes and closes. A reader daemon must keep it open permanently.
+
+**The reader is written: `nixos/synology-mcu/`, a serdev kernel driver.** Not a
+userspace daemon — in kernel space the bytes become real input events, so a
+power-button hold arrives as `KEY_POWER` and logind applies its ordinary policy
+with nothing holding a tty. `0x61` becomes `KEY_RESTART` rather than an actual
+reboot, because warm reboot does not work on this SoC (§7.3), so the policy
+belongs in userspace. Fan-failure bytes are logged at `dev_crit`.
+
+Built and verified on the bench, **not yet flashed**: the module cross-compiles
+warning-free with `vermagic 6.12.104 ... ARMv5` and the DT alias
+`of:N*T*Csynology,ds410j-mcu`, the DTB carries the new node, and the fan-control
+suite passes 55/55. It needs a USB stick reflash, which needs a human.
+
+Consequences, both handled — see `OPERATIONS.md`, "The `synology-mcu` kernel
+driver":
+
+- **`/dev/ttyS1` stops existing.** A serdev client owns its port. `ds410j-mcu.sh`
+  now writes to the driver's debugfs `send` file and only falls back to the
+  character device, so `mcu-panel.nix` and the fan daemon are unaffected.
+- **Power-off is untouched**, because it never used the tty: mainline's
+  `qnap-poweroff` (`CONFIG_POWER_RESET_QNAP=y`) binds the separate
+  `synology,power-off` node in `kirkwood-synology.dtsi`, ioremaps the same
+  registers and polls out `1` on its own. Deliberately *not* duplicated in the
+  driver: an accidentally broken power-off is the one failure that strands the
+  box.
+
+Unrelated loose end noticed on the way: **MPP6** is `MUX UNCLAIMED` in Linux so it
+keeps whatever U-Boot left, and `CONFIG_STRICT_DEVMEM=y` blocks `/dev/mem`.
+Upstream `board/Synology/ds109/ds109.c` sets `MPP6_SYSRST_OUTn`, so ours is
+*probably* already sel 1 like DSM's — worth confirming with `md 0xF1010000 8` at
+our U-Boot prompt some time, because it is the one pinmux bit the stock loader
+leaves in an invalid setting and it is a lead for warm reboot (§7.3).
+
+Once RX works, the button is a ~20-line userspace reader on `/dev/ttyS1`: one
+byte `0x30` -> `systemctl poweroff`. Note `nixos/ds410j-mcu.sh` is currently the
+only writer and takes an allowlist; a reader must not fight it for the port.
+
+- **The front-panel buttons are still not visible to software** [SUPERSEDED for
+  the power button by the subsection above; the exclusions below remain valid].
+  DSM shuts this box down cleanly on a short press [CONFIRMED by the owner,
+  twice], so a mechanism exists. The GPIO search below never found it because it
+  is not a GPIO.
 
   | tried | result |
   |---|---|

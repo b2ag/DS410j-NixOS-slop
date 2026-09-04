@@ -238,6 +238,11 @@ stty -F /dev/ttyS1 9600 cs8 -cstopb -parenb raw -echo
 printf ';' > /dev/ttyS1        # status LED: orange, blinking
 ```
 
+The channel is **bidirectional**: the MCU also *sends* one byte, and that is how
+the front-panel power button reaches software (see below).
+
+### Host -> MCU (commands)
+
 | Code | Hex | Effect | Source |
 |---|---|---|---|
 | `1` | `0x31` | **POWER OFF** | mainline `qnap-poweroff.c` |
@@ -251,7 +256,211 @@ printf ';' > /dev/ttyS1        # status LED: orange, blinking
 | `9` | `0x39` | status LED green, blinking | `grinst-common.sh` |
 | `:` | `0x3a` | status LED orange, static | `grinst-common.sh` |
 | `;` | `0x3b` | status LED orange, blinking | `grinst-common.sh` |
-| `t` | `0x74` | unidentified, DSM shutdown path | `syno_poweroff_task` |
+| `t` | `0x74` | **disable fan check** — DSM sends it on the shutdown path so the MCU does not raise a fan alarm as the fan stops | `syno_poweroff_task` + name table below |
+
+### The `synology-mcu` kernel driver
+
+`nixos/synology-mcu/` is an out-of-tree module that binds UART1 as a **serdev**
+client. It turns the MCU's event bytes into input events, so a power-button hold
+arrives as `KEY_POWER` and logind applies its normal policy — no daemon sitting
+on a tty.
+
+**It takes the port over: `/dev/ttyS1` no longer exists** once it binds. Two
+things follow, and both are already handled:
+
+- `ds410j-mcu.sh` writes to the driver's debugfs file first and only falls back
+  to `/dev/ttyS1`, so `mcu-panel.nix` and the fan daemon are unaffected.
+- **Power-off is untouched.** It never used the tty: mainline's `qnap-poweroff`
+  binds the separate `synology,power-off` node over the same registers and polls
+  out `1` itself. `dtc` even warns about the shared unit address, which is how
+  you can see the two nodes coexisting.
+
+What it gives you:
+
+```sh
+/sys/class/leds/synology:blue:power/brightness      # 4 / 6
+/sys/class/leds/synology:green:status/brightness    # 8 / 7
+/sys/class/leds/synology:amber:status/brightness    # : / 7
+```
+
+The two status colours are one physical lamp, so they are mutually exclusive —
+lighting one clears the other, the same constraint the bay LEDs have. Only
+on/off is exposed as a LED device: the MCU's *blinking* states are still sent as
+raw bytes, because a LED `brightness_set` callback that talks to a 9600 baud UART
+has to be the sleeping variant, and blink handling is not worth the complexity.
+
+**The debugfs interface exists so the module never becomes the thing that blocks
+experimenting.** Most of the command table below is inferred from another model,
+so raw access stays available:
+
+```sh
+printf ';' > /sys/kernel/debug/synology-mcu/send   # status lamp amber, blinking
+cat /sys/kernel/debug/synology-mcu/rx              # last 64 bytes, timestamped
+cat /sys/kernel/debug/synology-mcu/counters        # per-event totals
+```
+
+`send` passes bytes through verbatim (one trailing newline is stripped, so
+`echo 4 > send` does what it looks like). It refuses `1` and `p` — both cut
+power, and a soft-off DS410j needs a human at the front panel. Load the module
+with `allow_dangerous=1` if you mean it.
+
+### The wider `UART2_CMD_*` table [VERIFY — external, mostly untested here]
+
+`scemd` contains the string `Fan stop [UART2_CMD_CPUFAN_FAILURE]`, which says
+Synology's GPL `synobios` source has a named `UART2_CMD_*` enum. A third-party
+reverse-engineering write-up of that enum is at
+<https://smallhacks.wordpress.com/2012/04/17/working-with-synology-hardware-devsynobios-and-devttys1/>.
+
+**Every code we independently measured on this board matches it** — `0x31`
+shutdown, `0x32`/`0x33` beeps, `0x34`-`0x36` power LED, `0x37`-`0x3B` status LED,
+`0x30` power button, `0x61` reset button — which is good corroboration for the
+rest. But it describes Synology hardware in general, not the DS410j, so treat
+anything above `0x3B` as **[VERIFY]**: plausible, never tested here.
+
+| Hex | Char | Name | Note |
+|---|---|---|---|
+| `0x3d` | `=` | `LED_HD_BREATH` | status LED breathing |
+| `0x40` | `@` | `LED_USB_ON` | no USB LED on this box |
+| `0x41` | `A` | `LED_USB_BLINK` | " |
+| `0x42` | `B` | `LED_USB_OFF` | " |
+| `0x4a` | `J` | `LED_10G_LAN_ON` | n/a here |
+| `0x4b` | `K` | `LED_10G_LAN_OFF` | n/a here |
+| `0x50` | `P` | `LED_MIRROR_OFF` | n/a here |
+| `0x51` | `Q` | `LED_MIRROR_GS` | n/a here |
+| `0x52` | `R` | `LED_MIRROR_AS` | also listed as `GET_UNIQUE_CMD` on x86 |
+| `0x53` | `S` | `LED_MIRROR_AS` | n/a here |
+| `0x54` | `T` | `LED_MIRROR_AB` | n/a here |
+| `0x55` | `U` | `TOGGLE_FAN_RPS_REPORT` | **interesting** — implies the MCU can report fan RPM, a tacho this board was thought not to have |
+| `0x56` | `V` | `SET_PWM_DUTY` | our fan is a 3-bit GPIO speed select, so probably n/a |
+| `0x57` | `W` | `SET_PWM_FREQ` | " |
+| `0x6c` | `l` | `WOL_ENABLE` | the write-up notes it does not work on a DS207 |
+| `0x70` | `p` | `RCPOWEROFF` | **DANGEROUS — cuts power** |
+| `0x71` | `q` | `RCPOWERON` | |
+| `0x72` | `r` | `DISABLE_SCHEDULE_POWERON` | **a lead for §3.3** (power-on after AC loss) |
+| `0x73` | `s` | `ENABLE_SCHEDULE_POWERON` | " |
+| `0x74` | `t` | `DISABLE_FANCHECK` | confirmed in use on DSM's shutdown path |
+| `0x75` | `u` | `ENABLE_FANCHECK` | the thing to try for the fan events below |
+| — | `"EC0"` | `DISABLE_CPUFANCHECK` | multi-character, unlike everything else |
+| — | `"EC1"` | `ENABLE_CPUFANCHECK` | " |
+
+**Fan failure could not be reproduced here.** Disconnecting the fans produced no
+MCU traffic at all, on two attempts. So either fan checking is off by default
+(`0x75` `u` is the thing to try) or this model's MCU does not watch the fan.
+Against the latter: the stock Marvell loader prints `Fan Status: Good` in its
+banner, so *something* on this board reads a fan sensor.
+
+**Dangerous bytes, for the avoidance of doubt:** `0x31` (shutdown) and `0x70`
+(remote power off) both cut power. `ds410j-mcu.sh`'s allowlist exists precisely so
+no service can send one by accident.
+
+### MCU -> host (events)
+
+DSM's `scemd` recognises **exactly five** MCU->host bytes. The dispatch was read
+straight out of the binary (`event_microp.c`, function `MicropEventHandler`, the
+5-way compare at `0x1c37c`), so this table is complete, not a sample:
+
+| Code | Hex | Meaning | How known |
+|---|---|---|---|
+| `0` | `0x30` | **front-panel power button held ~4 s** (a short press sends nothing) | pressed on this board + `"power button pressed, ret = 0"` |
+| `` ` `` | `0x60` | **`UART2_CMD_BUTTON_USB`** — USB-copy button | `"USBcopy/Mute button pressed, Model error?"` — n/a here, `usbcopy="no"`, so this box takes the "Model error" branch |
+| `a` | `0x61` | **rear reset button** (duration threshold not separately measured) | pressed on this board + `"reset button pressed, ret = 0"` |
+| `f` | `0x66` | **`UART2_CMD_FAN_FAILURE`** — chassis fan failed | dispatch + fan strings in `scemd` + name table |
+| `g` | `0x67` | **`UART2_CMD_CPUFAN_FAILURE`** — CPU fan failed | ditto; `scemd` contains the literal string `Fan stop [UART2_CMD_CPUFAN_FAILURE]` |
+
+[CONFIRMED on both DSM and our own kernel.] **The MCU only reports a hold of
+about 4 seconds. A short press is ignored completely — it puts nothing on the
+wire at all.** The single byte is therefore *itself* the long-press event; there
+is no short-press event to distinguish it from. One byte per qualifying hold, no
+repeat while held, no byte on release, no hardware force-off. No GPIO pin moves
+for any of it.
+
+**This is what made the button look invisible for so long.** Every earlier test
+press on our kernel was a short tap, so `rx` stayed `0` and it looked like the
+MCU never transmitted to us. It always did. Three hypotheses were chased and all
+three were wrong: the UART1 receive pin was fine, an unheld port was not the
+cause, and no "arming" command exists. The only thing needed is to **hold the
+button ~4 s** with something keeping `/dev/ttyS1` open.
+
+**There is no handshake.** This was the obvious way the above could have been
+wrong — those measurements were first taken with `scemd` frozen (`SIGSTOP`),
+which by construction stalls any protocol that needs the host to reply. Retested
+with `scemd` running normally under an `LD_PRELOAD` that logs both directions:
+
+```
+[13:33:37.541] READ  fd=8  : 30 '0'     <- MCU: button pressed
+[13:33:38.641] WRITE fd=10 : 35 '5'     <- +1.10s  power LED -> blinking
+[13:33:39.761] WRITE fd=10 : 33 '3'     <- +2.22s  long beep
+[13:33:39.761] WRITE fd=10 : 35 '5'     <-         power LED -> blinking
+```
+
+The MCU said one byte and stopped. What the host writes back is not a reply, it
+is the ordinary shutdown indication (`5` = power LED blinking, `3` = long beep)
+from the command table above, and it comes a full second later. So the protocol
+is one-way and the frozen measurements were sound.
+
+Note the byte above arrived from a **hold**, not from the short press that
+preceded it in the same test — the MCU had ignored the tap. `scemd`'s `0x30`
+handler has no timer and no duration check because it does not need one: the MCU
+has already applied the 4 s threshold in firmware, and the byte only ever means
+"held long enough".
+
+Note the fds: **`scemd` reads the MCU on one descriptor and writes it on
+another** (8 and 10 here, both `/dev/ttyS1`). A tracer that keys on the fd the
+read came from will see none of the writes while `tx` climbs.
+DSM's `scemd` is the reader that turns it into a shutdown; freeze `scemd`
+(`kill -STOP`) and the byte sits unread in the tty buffer with the box still up.
+That test is what found it, and `/proc/tty/driver/serial` (`rx:` on line `1:`) is
+the cheapest way to see the byte arrive without consuming it. Full write-up in
+`PORTING.md` §7.1.
+
+**DSM has a second, kernel-side route to this tty.** `synobios.ko` imports
+`syno_ttys_write`, and its single call site is inside `synobios_ioctl`:
+`syno_ttys_write(1, sp+4, ...)`. Walking the ioctl dispatch in that function
+(the compare chain at the top branches to handler bodies; the body at `+0x128c`
+is the one containing the call at `+0x1360`) identifies the command exactly:
+
+```
+ioctl(fd_of_/dev/synobios, 0xc0044b20, &val)     /* _IOWR('K', 0x20, int) */
+```
+
+That is a usable primitive in its own right: it writes a byte to the MCU from
+kernel context. Note `scemd` itself never references `0xc0044b20` — the call
+comes from a Synology shared library, not the daemon binary.
+
+Consequences, all learned the hard way:
+
+- An `LD_PRELOAD` shim on `read`/`write` sees nothing (it is an ioctl), and a pty
+  man-in-the-middle on `/dev/ttyS1` sees nothing either (the kernel writes to the
+  real 8250, not to our pty) — while the `tx` counter climbs the whole time.
+- `ioctl` *is* interposable, unlike stdio. **But keep the shim tiny.** Wrapping
+  `open`/`close`/`dup`/`read`/`write` as well, or classifying every fd with a
+  `readlink` on `/proc/self/fd/N`, makes `scemd`'s main process fail to start —
+  it forks, runs, answers ioctls, and never opens `/dev/ttyS1`, with nothing on
+  stderr and nothing in syslog. A shim that only filters on a length or a
+  request-number compare leaves `scemd` perfectly healthy. Three further traps in
+  a `-nostdlib` shim: raw syscalls return `-errno` where every caller expects
+  `-1` with `errno` set (pass the call through libc's `syscall()` instead);
+  register-asm variables assigned late can be clobbered by the compiler; and
+  **interposing `execve` does not stop a shutdown** — glibc's `execv`/`execl`
+  reach `__execve` internally, so only a literal `execve()` call is caught. A
+  press still powers the box off with such a block in place.
+- The MCU->host direction is an ordinary tty read, which is why our `mcurx.py`
+  could read `0x30` straight off `/dev/ttyS1`.
+
+**Power-off does not go out over this tty from userspace.** A pty
+man-in-the-middle that dropped every `1` on its way to the MCU did **not** stop
+the box powering down: `scemd` just runs the normal `shutdown` path and the final
+cut comes from the **kernel** (`pm_power_off`, as in mainline `qnap-poweroff.c`)
+writing to the UART directly. Kernel-side writes bypass a userspace bridge, which
+is also why the MCU's `tx` counter advances with nothing in the bridge log. Two
+consequences: a userspace tap can only see *some* of the host->MCU traffic, and
+any trace must be streamed off-box — a log in `/tmp` dies with the shutdown it
+was recording (learned the hard way).
+
+The old "`rx:0` — the MCU never transmits" finding was measured on **our** kernel,
+not DSM's, and is still unexplained; the leading suspect is that MPP14 (UART1
+**rxd**) is not muxed by our U-Boot's DS109 MPP table, since our DTS declares no
+pinctrl for `serial@12100`. So a reader on our side is not yet known to work.
 
 `0x31`–`0x3B` is a **complete contiguous block** [CONFIRMED]: power, buzzer, power
 LED, status LED, in that order. `4`/`5` explain the front panel's normal

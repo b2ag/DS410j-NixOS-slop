@@ -403,6 +403,28 @@
 };
 
 /*
+ * The board microcontroller, as a serdev client rather than a bare tty.
+ *
+ * UART1 is already enabled by kirkwood-synology.dtsi (and mainline's
+ * qnap-poweroff binds a separate "synology,power-off" node over the same
+ * registers to send '1' at shutdown - that is independent of this and must keep
+ * working). Declaring a child node here hands the port to the serdev bus, so
+ * nixos/synology-mcu binds it and /dev/ttyS1 stops existing. That is the point:
+ * the front-panel buttons are not GPIOs, they arrive as single bytes on this
+ * UART, and a driver can turn them into real input events. See PORTING.md 7.1.
+ *
+ * The compatible is local, not an upstream binding.
+ */
+&uart1 {
+	status = "okay";
+
+	microcontroller {
+		compatible = "synology,ds410j-mcu";
+		current-speed = <9600>;
+	};
+};
+
+/*
  * eth0's MAC is deliberately NOT set here. The stock loader's vendor partition
  * (mtd3) holds 00:11:32:02:f9:a6 and our U-Boot passes it in via the ethernet0
  * alias, which is both correct for any DS410j and the only version of this that

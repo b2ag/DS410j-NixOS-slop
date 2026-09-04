@@ -65,6 +65,7 @@ in
     "${modulesPath}/installer/sd-card/sd-image.nix"
     ./device-tree.nix   # builds and installs our own kirkwood-ds410j.dtb
     ./fan-control.nix   # fan + bay LEDs, which the DTB is a prerequisite for
+    ./mcu-driver.nix    # synology-mcu: buttons -> input events, MCU debugfs
     ./mcu-panel.nix     # front-panel power/status lamps, via the board MCU
     ./readonly-root.nix # ro root + tmpfs for everything activation writes
   ];

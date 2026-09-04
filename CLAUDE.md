@@ -25,12 +25,26 @@ keep them mutually exclusive - `nixos/ds410j-fan-control.sh` does, with a
 regression test. Amber is the only colour an empty bay can show.
 
 
-**Two things are parked mid-investigation** and are listed at the top of
-`PORTING.md` under "Unfinished, and easy to forget". The live one is **the power
-button**: DSM shuts the box down on a short press and we still cannot see it. The
-stock loader MPP config has now been read, narrowing the candidates to MPP29, 44
-and 45. The others are the inconclusive **kwboot** test and the
-restore-last-power-state theory. Read that list before starting anything new.
+**The power button is solved** (`PORTING.md` §7.1): it is **not a GPIO**. Holding
+it ~4 s makes the board MCU send one byte, **`0x30`**, on UART1; a short press
+sends nothing, which is why fourteen GPIO candidates were searched for nothing.
+Confirmed working on our own kernel.
+
+**`nixos/synology-mcu/` is the driver for it** — an out-of-tree serdev module
+that turns MCU bytes into input events (`KEY_POWER`), exposes the two front-panel
+lamps as LED class devices, and offers a debugfs `send`/`rx`/`counters` interface
+for experimenting with the half-mapped protocol. Built and verified, **not yet
+flashed**. It **takes over UART1, so `/dev/ttyS1` stops existing**:
+`ds410j-mcu.sh` writes via debugfs first and falls back to the tty, and
+power-off is unaffected because that goes through mainline's `qnap-poweroff` on
+a separate DT node, never the tty. Full detail in `OPERATIONS.md`.
+
+**Two things remain parked mid-investigation** and are listed at the top of
+`PORTING.md` under "Unfinished, and easy to forget": the inconclusive **kwboot**
+test, and **power-on after AC loss**, whose restore-last-power-state theory now
+has a counter-example (a running box was cut and stayed off until someone pressed
+the button) — so **a remote `ds410j-power.sh cycle` cannot be relied on to bring
+the box back**. Read that list before starting anything new.
 
 **The box can be power-cycled remotely** - `kernel/ds410j-power.sh cycle`. Working
 theory (§3.3, small sample): the MCU restores the last power state, so cutting AC

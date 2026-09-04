@@ -17,6 +17,11 @@
 # (PORTING.md 3.3) - an accidental poweroff needs a human at the front panel.
 set -u
 
+# Preferred transport: the synology-mcu driver's debugfs interface. Once that
+# driver binds UART1 as a serdev client it owns the port exclusively and
+# /dev/ttyS1 no longer exists, so the character device is the fallback, not the
+# default - it is still the right answer on a kernel built without the module.
+MCU_DBG=${MCU_DBG:-/sys/kernel/debug/synology-mcu/send}
 MCU_DEV=${MCU_DEV:-/dev/ttyS1}
 
 case "${1:-}" in
@@ -26,6 +31,13 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
+# The driver's interface needs no termios setup - it fixed the port at 9600 8N1
+# when it bound. A single write of the character is the whole protocol.
+if [ -w "$MCU_DBG" ]; then
+  printf '%s' "$1" > "$MCU_DBG"
+  exit $?
+fi
 
 # Absent or unwritable is not an error: it just means there is no MCU to talk to
 # (a different board, or the unit tests). Say nothing and succeed.

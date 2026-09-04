@@ -208,6 +208,32 @@ for bad in 1 t x "" 0; do
   fi
 done
 
+# The driver's debugfs interface is the preferred transport once synology-mcu
+# owns UART1 and /dev/ttyS1 is gone. A good code must go there in preference to
+# the character device, and the allowlist must still be applied first.
+echo
+echo "MCU helper transport"
+: > "$ROOT/dbgsend"
+MCU_DBG="$ROOT/dbgsend" MCU_DEV=/dev/null sh ./ds410j-mcu.sh 8 >/dev/null 2>&1
+check "good code reaches debugfs send" 8 "$(cat "$ROOT/dbgsend")"
+
+: > "$ROOT/dbgsend"
+if MCU_DBG="$ROOT/dbgsend" MCU_DEV=/dev/null sh ./ds410j-mcu.sh 1 >/dev/null 2>&1; then
+  echo "  FAIL  poweroff reached debugfs send"; fail=$((fail+1))
+else
+  echo "  ok    poweroff refused before any transport"; pass=$((pass+1))
+fi
+check "nothing written for a refused code" "" "$(cat "$ROOT/dbgsend")"
+
+# No driver and no tty is the ordinary case on a build host: succeed silently
+# rather than failing a service.
+if MCU_DBG="$ROOT/nonexistent" MCU_DEV="$ROOT/nonexistent" \
+     sh ./ds410j-mcu.sh 8 >/dev/null 2>&1; then
+  echo "  ok    absent MCU is not an error"; pass=$((pass+1))
+else
+  echo "  FAIL  absent MCU treated as an error"; fail=$((fail+1))
+fi
+
 echo
 echo "bay LED pins are mutually exclusive"
 # The pins drive one anti-parallel bi-colour LED: equal levels = dark. A hot
