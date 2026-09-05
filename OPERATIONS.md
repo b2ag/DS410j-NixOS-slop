@@ -827,10 +827,23 @@ on every boot because `/etc` is a tmpfs - so expect the host-key warning and use
 
 ## Flashing the USB stick without a human — UNTESTED, work in progress
 
-**Status 2026-09-05: written, not yet run.** `kernel/flasher.nix` and
-`kernel/flash-init.sh` exist and evaluate; the kernel had not finished building
-when this was written and **nothing here has been booted or verified on the
-hardware**. Treat every claim below as intent, not fact, until it has been.
+**Status 2026-09-05: both halves BUILT, neither BOOTED.** `kernel/flasher.nix`
+and `kernel/flash-init.sh` compile, and the payload they are meant to write
+exists. **Nothing here has been booted or verified on the hardware** - building
+only proves it compiles, not that it enumerates the stick or streams correctly.
+Treat every claim below as intent, not fact, until it has been run.
+
+Artefacts, ready to use:
+
+| | |
+|---|---|
+| flasher | `/nix/store/99wzhd74sy9sgw5iysqpnpybd6z0l4c4-ds410j-flasher-6.12.104` (`zImage` 5,280,888 B; `uImage` 5,302,264 B) |
+| image | `nix-build /src/nixos -A image` -> 698,912,768 bytes |
+| image sha256 | `feddf2af490f49c771ba4c5d8c5bc03ee0ad86ec4ba9001410e9b7c7e9f1a9d4` |
+
+Those last two are exactly the `flash.size=` and `flash.sha256=` the flasher
+wants on its command line. The image grew 22.5 MB over the pre-LUKS one, which
+is the entire cost of cryptsetup + lvm2 + btrfs-progs + ksmbd-tools.
 
 The goal is to remove the one remaining human dependency in this project.
 CLAUDE.md says "a bad image still needs a human"; this is the answer to that. The
