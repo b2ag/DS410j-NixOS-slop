@@ -93,6 +93,39 @@ let
     "--disable FB"
     "--disable WLAN"
     "--enable KERNEL_XZ"
+
+    # THE SAFETY PROPERTY, and the reason these lines are not just size trimming.
+    #
+    # `--disable MODULES` turns every `=m` in mvebu_v5_defconfig into `=y`, so a
+    # flasher built without these came up with SATA_MV, PCI and MTD compiled in.
+    # That quietly breaks the two claims this tool rests on:
+    #
+    #   * that /dev/sda is the USB stick. With sata_mv present the two 3 TB
+    #     Toshibas enumerate too, and disk-vs-USB probe order is a timing race -
+    #     so `flash.dev=/dev/sda` could land on a data drive.
+    #   * that "nothing here writes to MTD, ever". True of the script, but a
+    #     kernel with MTD built in leaves /dev/mtd* sitting there next to the one
+    #     partition that must never be written (CLAUDE.md: never write mtd0).
+    #
+    # Removing the drivers makes both structural rather than a matter of care:
+    # the flasher cannot reach a SATA drive or the SPI flash because it has no
+    # code to do so, and the only block device that can appear is the stick.
+    # flash-init.sh still validates the target is USB-attached - defence in
+    # depth, so a rebuild that loses these lines is not silently dangerous.
+    # `--disable ATA` is the load-bearing one: SATA_MV depends on it, so it
+    # disappears from the config entirely rather than needing to be held down.
+    # Verified on the built kernel - ATA/SATA_MV/MTD/MMC are all off and the
+    # string "sata_mv" does not occur in the zImage.
+    #
+    # PCI is listed but does NOT stay off: `make olddefconfig` re-selects it
+    # from the mvebu platform. That is fine and not worth fighting - PCI with no
+    # ATA driver cannot reach the 88SX7042, so the bays stay invisible either
+    # way. Do not "fix" this by assuming the line works.
+    "--disable PCI"
+    "--disable ATA"
+    "--disable SATA_MV"
+    "--disable MTD"
+    "--disable MMC"
   ];
 
   dtb = "marvell/kirkwood-ds409.dtb";

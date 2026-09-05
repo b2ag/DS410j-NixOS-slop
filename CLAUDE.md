@@ -54,8 +54,25 @@ on a **running** box brings it back, but a **soft-off** box stays off and only t
 front-panel button revives it. So the command that strands the box is
 `systemctl poweroff`, not the outlet - never issue it remotely. Also: the 433 MHz
 radio reaches **every outlet in the house**, so the address in
-`ds410j-power.sh` is hardcoded and must never be parameterised. None of this
-helps with flashing the USB stick, so a bad image still needs a human.
+`ds410j-power.sh` is hardcoded and must never be parameterised.
+
+**Reflashing the USB stick no longer needs a human either** [CONFIRMED
+2026-09-05]. `kernel/flasher.nix` + `kernel/flash-init.sh` are a TFTP-booted
+kernel with a busybox initramfs that streams a new image onto the stick from
+plain HTTP, verifies it by reading it back, and has the MCU restart the board;
+`kernel/serve-image.py` serves the image and prints the U-Boot block to paste.
+Proven end to end: 698,912,768 bytes written in 99 s, `VERIFIED sha256`, box back
+at a login prompt. Full procedure and evidence in `OPERATIONS.md`, "Flashing the
+USB stick without a human". Two things to know before relying on it:
+
+- The flasher kernel is built with **`ATA`, `MTD` and `MMC` disabled** so the SATA
+  bays and the SPI flash are *unreachable*, not merely untouched, and the single
+  USB disk is provably the target. `--disable MODULES` turns every `=m` in
+  `mvebu_v5_defconfig` into `=y`, so those lines are load-bearing safety, not size
+  trimming - a rebuild that drops them puts a 3 TB drive one probe race away from
+  being called `/dev/sda`. `flash-init.sh` re-checks from userspace as well.
+- A reflash **loses the hand-installed bench ssh key**, which is not in
+  `configuration.nix`; it has to be re-added over serial afterwards.
 
 **The board MCU is a mapped command channel** (`/dev/ttyS1`, 9600 8N1, single ASCII
 characters). `0x31`-`0x3B` is fully mapped: `1` power off, `2`/`3` beep, `4`/`5`/`6`

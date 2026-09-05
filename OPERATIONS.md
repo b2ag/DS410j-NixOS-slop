@@ -65,6 +65,8 @@ Worth knowing before interpreting anything, and easy to get wrong from a log alo
 | `ds410j-bench.sh` | **Runs on the DS410j, not here.** Drive the fan, LEDs and MCU by hand; `led bay N` shows the anti-parallel wiring. |
 | `kwboot-test.sh` | Probe the SoC BootROM UART recovery path. Writes nothing. |
 | `ds410j-power.sh` | Remote mains switch via the 433 MHz outlet. `cycle` is the safe verb. |
+| `serve-image.py` | Serve a NixOS image to the flasher over HTTP and print the U-Boot block to paste. Range-capable, unlike `python3 -m http.server`. |
+| `test-flash-init.sh` | 21 assertions over `flash-init.sh`'s cmdline parsing and USB-target selection, against a fake sysfs. No hardware. |
 
 Typical session start:
 
@@ -825,72 +827,225 @@ on every boot because `/etc` is a tmpfs - so expect the host-key warning and use
 `-o UserKnownHostsFile=/dev/null`.
 
 
-## Flashing the USB stick without a human — UNTESTED, work in progress
+## Flashing the USB stick without a human — WORKS [CONFIRMED 2026-09-05]
 
-**Status 2026-09-05: both halves BUILT, neither BOOTED.** `kernel/flasher.nix`
-and `kernel/flash-init.sh` compile, and the payload they are meant to write
-exists. **Nothing here has been booted or verified on the hardware** - building
-only proves it compiles, not that it enumerates the stick or streams correctly.
-Treat every claim below as intent, not fact, until it has been run.
+**Status 2026-09-05: done, end to end, on the hardware.** One run took the box
+from a booted NixOS, through `systemctl reboot`, into the flasher over TFTP,
+wrote a 698,912,768-byte image onto the stick, verified it by reading it back,
+and had the MCU restart the board into the result — which came up to a serial
+login. No hands on the device at any point.
 
-Artefacts, ready to use:
-
-| | |
-|---|---|
-| flasher | `/nix/store/99wzhd74sy9sgw5iysqpnpybd6z0l4c4-ds410j-flasher-6.12.104` (`zImage` 5,280,888 B; `uImage` 5,302,264 B) |
-| image | `nix-build /src/nixos -A image` -> 698,912,768 bytes |
-| image sha256 | `feddf2af490f49c771ba4c5d8c5bc03ee0ad86ec4ba9001410e9b7c7e9f1a9d4` |
-
-Those last two are exactly the `flash.size=` and `flash.sha256=` the flasher
-wants on its command line. The image grew 22.5 MB over the pre-LUKS one, which
-is the entire cost of cryptsetup + lvm2 + btrfs-progs + ksmbd-tools.
+**CLAUDE.md's "a bad image still needs a human" is no longer true.** A reflash is
+now a remote operation, and that was the last human dependency in the project.
+The one caveat is the bench ssh key: it is installed by hand and not in
+`configuration.nix`, so every reflash loses it and it has to be re-added over
+serial (see "Physical state of the bench").
 
 The goal is to remove the one remaining human dependency in this project.
 CLAUDE.md says "a bad image still needs a human"; this is the answer to that. The
 flasher is a TFTP-bootable kernel with an embedded busybox initramfs that runs
-entirely in RAM, streams a new image onto the USB stick, verifies it, and asks
-the MCU to restart the board.
+entirely in RAM, streams a new image onto the USB stick, verifies it by reading
+it back, and asks the MCU to restart the board.
 
 **Why it is safe to attempt.** The two-stage bootloader chain lives in SPI flash,
 not on the stick. A failed or interrupted write cannot brick anything: our U-Boot
 finds no bootflow, drops to its prompt, and the flasher can simply be booted
-again. The flasher never touches MTD.
+again. Nothing is written until the flasher has already booted, so a flasher that
+fails to come up costs nothing at all — the old stick is still intact.
 
-**Why it streams.** The image is ~680 MB against 118 MB of RAM, so it can never
+**Why it streams.** The image is ~700 MB against 118 MB of RAM, so it can never
 be buffered - `wget -O - | dd of=/dev/sda bs=1M` is not a stylistic choice.
 
-Intended use, once it works:
+### The transport: plain HTTP, and it works
 
-```
-tftpboot 0x00800000 zImage-flasher
-tftpboot 0x02000000 ds410j.dtb
-setenv bootargs 'console=ttyS0,115200n8 flash.url=http://192.168.50.1:8080/ds410j-nixos.img
-                 flash.sha256=<hex> flash.size=<bytes> flash.dev=/dev/sda flash.ip=192.168.50.60'
-bootz 0x00800000 - 0x02000000
+**This file previously recorded "running an HTTP server in this container was
+refused by the sandbox". That is wrong.** A bind on `192.168.50.1:8080`
+succeeds, and the box pulls from it at **11.7 MB/s — line rate for the 100 Mb/s
+bench link** (measured with `curl` over ssh, 100 MB range request, 8.9 s). At
+that rate the 699 MB image is about 60 s of network time, so the USB stick's
+write speed, not the link, is the thing to watch.
+
+What probably caused the wrong conclusion: **`python3 -m http.server` silently
+ignores `Range` requests.** It answers `200` with the whole 699 MB body no matter
+what you asked for, so probing it with `curl -r 0-1048575` looks exactly like a
+hang. Use the helper instead:
+
+```sh
+/src/kernel/serve-image.py            # serves nixos/result-image, prints size + sha256
+/src/kernel/serve-image.py --image /path/to.img
+/src/kernel/serve-image.py --no-hash  # skip the sha256 if you already have it
 ```
 
-It builds two images on purpose, because a recovery tool must not depend on our
+It is threaded, implements `Range` properly, logs transfer progress every 5 s so
+a stalled flash is visible from here, and — the useful part — **prints the exact
+U-Boot command block with `flash.sha256` and `flash.size` already filled in**,
+for both boot paths. Copy-paste it at the prompt.
+
+The rejected alternatives, for the record: **`nc` push** (box listens, container
+pushes) needs no server but gives the box no content length, so a truncated push
+is indistinguishable from a complete one; **dnsmasq's TFTP** cannot carry 700 MB,
+since the 16-bit block counter caps a transfer at ~32 MB (~96 MB with `blksize`
+negotiation).
+
+### Why it cannot eat the array
+
+The first build of this tool had a hole worth remembering, because it came from a
+line that looks like pure size trimming. `flasher.nix` sets `--disable MODULES`,
+and that turns **every `=m` in `mvebu_v5_defconfig` into `=y`** — so the flasher
+came up with `PCI`, `ATA`, `SATA_MV` and `MTD` compiled in. Two claims quietly
+stopped being true:
+
+- **that `/dev/sda` is the stick.** With `sata_mv` present the two 3 TB Toshibas
+  enumerate as well, and USB-vs-SATA probe order is a timing race. `flash.dev=/dev/sda`
+  could have landed on a data drive.
+- **that "nothing here writes to MTD, ever".** True of the script, but a kernel
+  with MTD built in leaves `/dev/mtd*` sitting next to the one partition that must
+  never be written.
+
+Both are now structural rather than a matter of care:
+
+- `flasher.nix` disables `ATA` (which is the load-bearing one — `SATA_MV` depends
+  on it and vanishes entirely), plus `MTD` and `MMC`. Verified on the built
+  kernel: `# CONFIG_ATA is not set`, `SATA_MV` absent, and the string `sata_mv`
+  does not occur in the zImage. **`PCI` stays `=y`** — `olddefconfig` re-selects
+  it from the platform — which is harmless, because PCI with no ATA driver cannot
+  reach the 88SX7042. Do not assume that `--disable PCI` line does anything.
+- `flash-init.sh` defaults to **`flash.dev=auto`**, which resolves the target by
+  walking sysfs for the single USB-attached disk, and **refuses a non-USB target**
+  unless `flash.force=1`. It also refuses a stick smaller than `flash.size`,
+  because otherwise a too-small stick fails at `ENOSPC` most of the way through
+  and surfaces minutes later as a mystery checksum mismatch.
+
+`kernel/test-flash-init.sh` covers that logic against a fake sysfs and a fake
+`/proc/cmdline` — 21 assertions, in the style of `nixos/test-fan-control.sh`. It
+extracts the functions out of `flash-init.sh` rather than copying them, so it
+cannot drift.
+
+One correction it also records: the original `arg()` used
+`sed 's/.*\bKEY=\([^ ]*\).*/\1/p'`, which was suspected broken because busybox
+sed and `\b`. **Checked against busybox 1.37: `\b` works fine.** What is
+genuinely wrong with that pattern is that the dots in the keys are regex
+wildcards, so `flash.url` also matches `flashXurl=` (verified). The word loop
+that replaced it needs no escaping and cannot match a key nobody wrote.
+
+The other real bug fixed at the same time: `wget -O - | dd of=$DEV` reports
+**dd's** exit status, not wget's, so a transfer that died half way through looked
+like success. `flash-init.sh` now sets `pipefail` (present in this busybox), and
+the read-back sha256 is the authority regardless.
+
+### Procedure
+
+Stage the payload once per kernel change:
+
+```sh
+nix-build /src/kernel/flasher.nix -o /src/kernel/result-flasher
+S=$(readlink -f /src/kernel/result-flasher)
+cp -f $S/zImage             /var/lib/tftpboot/zImage-flasher
+cp -f $S/uImage             /var/lib/tftpboot/uImage-flasher
+cp -f $S/kirkwood-ds409.dtb /var/lib/tftpboot/kirkwood-ds409-flasher.dtb
+```
+
+Then serve the image and paste what it prints:
+
+```sh
+nix-build /src/nixos -A image -o /src/nixos/result-image
+/src/kernel/serve-image.py
+```
+
+**Getting to our U-Boot's prompt takes two interrupt windows, not one.** This is
+the part that is fiddly and was worth writing down. `spam.sh` interrupts whatever
+countdown is running, and the stock loader's 3 s window comes first — so
+spamming from the reboot lands you at `Marvell>>`, not at our `=>`. The sequence
+that works:
+
+```sh
+setsid /src/kernel/spam.sh 240 & disown          # 1. catch the stock loader
+ssh -i ~/.ssh/ds410j root@$DS 'systemctl reboot' #    (MCU 'C' restart, PORTING.md §3.3)
+# ... lands at Marvell>> ...
+pkill -f spam.sh                                 # 2. stop, or it fights you
+
+setsid /src/kernel/spam.sh 45 & disown           # 3. re-arm for OUR loader
+#    then immediately, at the Marvell>> prompt:
+#      bootm F8080000 F8280000
+#    which is the stock bootcmd verbatim: mtd1 (our U-Boot) + the mtd2 stub.
+#    Our U-Boot's bootdelay is 2 s, so the spam catches it -> `=>`
+```
+
+At `=>`, paste the block `serve-image.py` printed. The kernel is ~5 MB, so the
+`tftpboot` takes about 15 s at 3.6 MiB/s; check `Bytes transferred` matches
+`zImage-flasher` exactly before booting it.
+
+Watch out for **two readers on `/dev/ttyUSB0`**. A leftover `serlog.sh` from an
+earlier session plus a new one splits the bytes between them and quietly corrupts
+the log. Check with `ps -eo pid,args | grep '[c]at /dev/ttyUSB0'` and keep exactly
+one. Also note `pkill -f` is dangerous here: a pattern like `http.server` or
+`python3 -c` matches the shell running the `pkill` itself and kills it. Match on
+something narrower, or kill by pid.
+
+It builds two kernels on purpose, because a recovery tool must not depend on our
 own U-Boot in mtd1 being healthy:
 
-- `zImage` — for our U-Boot 2026.07, `bootz` with a separate DTB.
-- `uImage` — for the **stock** Marvell 1.1.4, which has no `fdt` command, so the
-  DTB is appended and the whole thing wrapped as `IH_TYPE_KERNEL`.
+- `zImage-flasher` + `kirkwood-ds409-flasher.dtb` — our U-Boot 2026.07, `bootz`
+  with a separate DTB.
+- `uImage-flasher` — the **stock** Marvell 1.1.4, which has no `fdt` command, so
+  the DTB is appended and the whole thing wrapped as `IH_TYPE_KERNEL`.
 
-**The open problem: how to serve 680 MB to the box.** The flasher currently
-expects plain HTTP, but running an HTTP server in this container was refused by
-the sandbox. Options, none yet tried:
+It uses mainline `kirkwood-ds409.dtb`, **not** our corrected
+`kirkwood-ds410j.dts`, and that is deliberate: the four defects the corrected DTS
+fixes are bay LED colours, the fifth bay, the gpio-fan node and the
+eth1/native-SATA MPP21 collision. The flasher needs none of them — it drives no
+LEDs, no fan and no SATA, and only ever uses eth0. One less thing to keep in sync.
 
-1. Have the *box* listen and the container push - `nc -l -p 9000 | dd of=/dev/sda`
-   on the DS410j, `cat img | nc 192.168.50.60 9000` from here. Needs no server on
-   the container side at all, which is why it is the favourite.
-2. dnsmasq's TFTP, which is already running - but classic TFTP's 16-bit block
-   counter caps a transfer at 32 MB (about 96 MB with `blksize` negotiation), so
-   a 680 MB image does not fit without block-counter rollover. Probably a dead
-   end.
-3. Grant the container permission to run an HTTP server.
+**The fan, while the flasher is running.** The flasher has no `gpio-fan` driver
+and no fan control, so it does not touch GPIO0 15/16/17 — whatever the bootloader
+left is what the fan keeps doing. Via our U-Boot that is the safe speed pinned in
+`board_init()`; via the stock loader it is the hardware default. Either way the
+fan is not switched off, but a flasher session is minutes, not hours, and nothing
+in it is thermally interesting.
 
-Whichever is chosen, `flash-init.sh` needs its transfer step adjusted to match;
-everything else in it is transport-agnostic.
+### Evidence from the first live run [CONFIRMED 2026-09-05]
+
+- [x] **the flasher kernel boots and reaches the initramfs** — `Run /init as init
+      process`, then the banner, with `106024 kB available` of the 118 MB.
+- [x] **eth0 comes up and negotiates** — `mv643xx_eth_port.0 eth0: link up,
+      100 Mb/s, full duplex`.
+- [x] **the stick is found by `flash.dev=auto` and identified as USB** —
+      `USB disks: sda` / `sda 7864320 sectors, usb=yes Alu Line` /
+      `auto-selected /dev/sda` / `/dev/sda is USB-attached, good`. The stick is a
+      4.03 GB Intenso Alu Line.
+- [x] **the capacity check passes rather than just not firing** —
+      `capacity 4026531840 bytes` / `image needs 698912768 bytes, fits with
+      3327619072 to spare`.
+- [x] **the stream completes** — `write finished in 99s`, i.e. **6.7 MB/s**. The
+      link does 11.7 MB/s, so the **USB stick's write speed is the bottleneck**,
+      not the bench ethernet. Budget ~100 s of writing per reflash.
+- [x] **the read-back sha256 matches** — `VERIFIED sha256 feddf2af...`, against
+      the `flash.sha256=` passed on the cmdline.
+- [x] **`printf 'C' > /dev/ttyS1` restarts the board from the flasher** — the
+      script's 5-second-later `MCU did not restart the board` message never
+      printed, and the next thing on the console is a fresh boot. So the MCU
+      restart path works from a plain initramfs with no `synology-mcu` driver,
+      exactly as PORTING.md §3.3 predicted.
+- [x] **the flashed image boots** — the box reached `ds410j login:` and a root
+      shell on the new image.
+
+**And the safety property held on hardware, visibly.** The only block device that
+appeared was `sda`, the stick. With `ATA` disabled the two 3 TB Toshibas did not
+enumerate at all — no `ata1`/`ata2` lines, no `sdb`. There was nothing else on the
+box for `flash.dev=auto` to get wrong.
+
+Total wall clock, `systemctl reboot` to a login prompt on the new image: about
+six minutes, most of it the 99 s write and the read-back hash (sha256 on an
+800 MHz ARMv5 is not fast).
+
+Two cosmetic things worth not re-debugging:
+
+- `[flash] carrier=1 speed=-1Mb/s` — the carrier wait finishes before the PHY has
+  settled, so `/sys/class/net/eth0/speed` still reads `-1`. The link comes up
+  normally a moment later. Harmless; the wget waits anyway.
+- `cfg80211: failed to load regulatory.db` and the X.509 certificate lines are
+  `mvebu_v5_defconfig` baggage in a kernel with `WLAN` disabled. Noise, not a
+  fault.
 
 ## Iterating on U-Boot
 

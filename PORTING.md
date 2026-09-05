@@ -1488,8 +1488,66 @@ even if the partition were re-carved. `ksmbd` is the one to use.
 
 **Note the partition is full**, which affects everything in this section: adding
 cryptsetup, lvm2, btrfs-progs and ksmbd-tools all require rebuilding the image
-with a larger root partition and **reflashing the USB stick** - which needs a
-human at the bench (CLAUDE.md). Budget for that before planning the work.
+with a larger root partition and **reflashing the USB stick** — which no longer
+needs a human at the bench, see §7.2.5. Budget ~100 s of writing per reflash.
+
+**`nixos/ksmbd.nix` is now flashed and boots, but the service FAILS**
+[CONFIRMED 2026-09-05]. It went onto the stick as part of the flasher's first
+live run, so its "evaluates, has never served a file" status is now sharper: the
+module loads fine but the daemon dies on startup and the system is `degraded`.
+
+- The kernel side is fine: `lsmod` shows `ksmbd 311296 0` with `cifs_arc4` and
+  `nls_ucs2_utils` pulled in, so `CONFIG_SMB_SERVER=m` via `boot.kernelPatches`
+  did what it was meant to.
+- The userspace side does not survive: `ksmbd.mountd` logs
+  `INFO: Started manager`, then `INFO: Started worker`, then
+  **`INFO: Terminated`** and exits 1. systemd restarts it ten times and gives up
+  with `start-limit-hit`.
+- The likely lead, from the same journal: `ksmbd.adduser` logs
+  **`INFO: No configuration file`** just before writing the password db. So the
+  generated `/etc/ksmbd/ksmbd.conf` is probably not where the tools look, or is
+  not readable at the point they look — consistent with `/etc` being tmpfs here
+  and the db being rebuilt into `/run` on every boot. Check the path
+  `ksmbd.mountd` is actually passed before changing anything else.
+
+This is unrelated to the flasher; it is the next thing to fix in this section.
+
+### 7.2.5 Remote reflashing of the USB stick — DONE [CONFIRMED 2026-09-05]
+
+The last human dependency in the project is gone. `kernel/flasher.nix` builds a
+TFTP-bootable kernel with a static-busybox initramfs that runs entirely in RAM,
+streams a new image from plain HTTP straight onto the USB stick, verifies it by
+reading it back, and asks the MCU to restart the board. `kernel/serve-image.py`
+serves the image and prints the U-Boot block to paste. Full procedure, evidence
+and gotchas: `OPERATIONS.md`, "Flashing the USB stick without a human".
+
+One run, no hands on the device: 698,912,768 bytes written in **99 s** (6.7 MB/s,
+**stick-limited** — the bench link does 11.7 MB/s), `VERIFIED sha256 feddf2af…`,
+MCU restart, box back at `ds410j login:` on the new image.
+
+Three findings worth keeping:
+
+1. **`--disable MODULES` is not a size flag.** It rewrites every `=m` in
+   `mvebu_v5_defconfig` to `=y`, so the first flasher came up with `PCI`, `ATA`,
+   `SATA_MV` and `MTD` built in. That silently voided both of the tool's safety
+   claims: `/dev/sda` was no longer provably the stick (the two 3 TB Toshibas
+   enumerate too, and USB-vs-SATA probe order is a race), and a kernel with MTD
+   compiled in leaves `/dev/mtd*` next to the partition that must never be
+   written. `flasher.nix` now disables `ATA` (load-bearing: `SATA_MV` depends on
+   it and disappears), `MTD` and `MMC`. **`PCI` stays `=y`** — `olddefconfig`
+   re-selects it from the platform — which is harmless without an ATA driver. On
+   hardware the property was visible: the only block device that appeared was
+   `sda`, with no `ata*` lines at all.
+2. **`wget -O - | dd of=$DEV` reported dd's exit status, not wget's**, so a
+   transfer that died half way through looked like success. Fixed with `pipefail`;
+   the read-back sha256 is the authority regardless.
+3. **The MCU restart works from a bare initramfs.** `printf 'C' > /dev/ttyS1` with
+   no `synology-mcu` driver loaded restarts the board, confirming §3.3's mechanism
+   is the MCU and not anything the driver adds.
+
+`kernel/test-flash-init.sh` covers the cmdline parsing and USB-target selection
+against a fake sysfs — 21 assertions, no hardware, in the style of
+`nixos/test-fan-control.sh`.
 
 ### 7.3 Smaller items
 
