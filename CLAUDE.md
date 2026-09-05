@@ -73,8 +73,9 @@ USB stick without a human". Two things to know before relying on it:
   `mvebu_v5_defconfig` into `=y`, so those lines are load-bearing safety, not size
   trimming - a rebuild that drops them puts a 3 TB drive one probe race away from
   being called `/dev/sda`. `flash-init.sh` re-checks from userspace as well.
-- A reflash **loses the hand-installed bench ssh key**, which is not in
-  `configuration.nix`; it has to be re-added over serial afterwards.
+- A reflash keeps ssh working: the bench key is in `configuration.nix`, so it
+  comes back with the image. Do not hand-install one into `/root/.ssh` — `/root`
+  is a tmpfs and it will not survive the next boot.
 
 **The board MCU is a mapped command channel** (`/dev/ttyS1`, 9600 8N1, single ASCII
 characters). `0x31`-`0x3B` is fully mapped: `1` power off, `2`/`3` beep, `4`/`5`/`6`

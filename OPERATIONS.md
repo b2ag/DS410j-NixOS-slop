@@ -43,14 +43,25 @@ Worth knowing before interpreting anything, and easy to get wrong from a log alo
 - Root password on the serial console is `ds410j` - a v1 placeholder, see
   `nixos/configuration.nix`.
 - **ssh from this container** works and is much faster than the serial console for
-  anything non-boot. A key was installed via serial into `/root/.ssh/authorized_keys`:
+  anything non-boot:
   ```sh
   ssh -i ~/.ssh/ds410j root@192.168.50.138
   ```
   The address is the DHCP lease, not the `192.168.50.50` U-Boot uses; check it with
-  `ip neigh show dev eth1` and look for the vendor MAC `00:11:32:02:f9:a6`. The key
-  is bench convenience only — it is not in `configuration.nix`, so a reflash of the
-  USB stick loses it and it has to be re-added over serial.
+  `ip neigh show dev eth1` and look for the vendor MAC `00:11:32:02:f9:a6`.
+
+  **The key survives a reflash and never needs re-adding** [CONFIRMED
+  2026-09-05]. It used to be installed by hand into `/root/.ssh/authorized_keys`
+  and this file said a reflash loses it; both stopped being true when it moved
+  into `configuration.nix` (`users.users.root.openssh.authorizedKeys.keys`, with
+  a `lib.warn` on every evaluation so it cannot be shipped by accident). It now
+  arrives from the store as `/etc/ssh/authorized_keys.d/root`, which is where
+  sshd's second `AuthorizedKeysFile` entry looks.
+
+  Do not try to put a key in `/root/.ssh` by hand: **`/root` is an 8 MB tmpfs**
+  under `readonly-root.nix`, so anything written there is gone on the next boot.
+  Two reflashes were followed by a pointless re-add over serial before this was
+  checked.
 
 ## Helper scripts (`/src/kernel/`)
 
@@ -837,9 +848,8 @@ login. No hands on the device at any point.
 
 **CLAUDE.md's "a bad image still needs a human" is no longer true.** A reflash is
 now a remote operation, and that was the last human dependency in the project.
-The one caveat is the bench ssh key: it is installed by hand and not in
-`configuration.nix`, so every reflash loses it and it has to be re-added over
-serial (see "Physical state of the bench").
+There is no ssh caveat: the bench key lives in `configuration.nix` and comes back
+with the image (see "Physical state of the bench").
 
 The goal is to remove the one remaining human dependency in this project.
 CLAUDE.md says "a bad image still needs a human"; this is the answer to that. The
@@ -1037,6 +1047,19 @@ box for `flash.dev=auto` to get wrong.
 Total wall clock, `systemctl reboot` to a login prompt on the new image: about
 six minutes, most of it the 99 s write and the read-back hash (sha256 on an
 800 MHz ARMv5 is not fast).
+
+**Second run, 2026-09-05, to ship the cleaned-up device tree.** Same procedure,
+same result: 698,904,576 bytes written in **97 s**, `VERIFIED sha256 9ee4182a…`,
+MCU restart, box back up. Worth recording because it is the first time the
+flasher was used for its actual purpose rather than to test itself, and because
+it confirms the timing is repeatable rather than a one-off. Proof the payload
+changed: the DTB on `/boot` went from 30130 to **28194** bytes, the
+`gpio-keys-candidates` node and the `pmx-ds410j-buttons` pinmux are gone from
+`/proc/device-tree`, and `/sys/class/input` lists only the front panel where it
+used to list the diagnostic node first. Nothing regressed — `gpio-fan-150-15-18`
+still bound, both hwmons present (gpio_fan and lm75), board 44.3 C, drives 37/35 C,
+fan at its 2200 rpm baseline, zero deferred probes. `systemctl is-system-running`
+reports `degraded` with exactly one failed unit, the WIP `ksmbd.service`.
 
 Two cosmetic things worth not re-debugging:
 
