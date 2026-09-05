@@ -59,25 +59,18 @@
  *    message on every boot.
  *
  *
- * 5. THE BUTTONS ARE NOT VISIBLE, AND IT IS OUR OWN BOOTLOADER'S DOING.
- *    DSM shuts this box down cleanly on a short press of the power button
- *    [CONFIRMED by the owner, twice]. Under our stack nothing sees it: no
- *    change on any of 39 readable GPIO lines, nothing from the microcontroller
- *    (rx stays 0 for both power and reset), and no power-off on a 10 s hold.
+ * The front-panel buttons are deliberately NOT described here, and that is a
+ * finding rather than an omission: they are not GPIOs at all. Holding power for
+ * ~4 s makes the board MCU send one byte, 0x30, on UART1; a short press sends
+ * nothing. See the &uart1 node at the bottom of this file, and PORTING.md 7.1.
  *
- *    The reason is that we chainload a U-Boot built from ds109_defconfig, and
- *    the DS109 MPP table sets MPP12_GPO, MPP20_SATA1_ACTn, MPP21_SATA0_ACTn.
- *    GPO is output-only, so a button on MPP12 cannot be read at all, and
- *    reading its GPIO returns the output register rather than the pad - which
- *    is exactly why a press produced no change and the search looked conclusive
- *    when it was not. DSM never has this problem: stock loader, own board file.
- *
- *    Of the pins our boot chain renders unreadable, only three can be inputs on
- *    an 88F6281 at all (pinctrl-kirkwood.c): MPP12, MPP20 and MPP21 - 5, 7 and
- *    19 are "gpo" on every variant and so can never be a button. The gpio-keys
- *    node below claims those three to force them back to gpio. It is a
- *    diagnostic: whichever one reports a press is the button, and it then
- *    becomes a single KEY_POWER entry and the others are deleted.
+ * Recorded so nobody repeats it: a GPIO search for these buttons is a dead end.
+ * Fourteen candidate pins were claimed by a gpio-keys node here and every one
+ * came back negative. The pins were only ever readable because that node forced
+ * them to input - gpioinfo reports nearly every line as an OUTPUT, so gpioget
+ * otherwise reads the output latch rather than the pad, which is what made an
+ * earlier round look conclusive when it was not. None of that scaffolding is
+ * needed now and none of it is left in this file.
  *
  * Not fixed here, and not fixable here: the alarm/status and power lamps.
  * kirkwood-synology.dtsi's gpio-leds-alarm-12 node is spurious on this model -
@@ -127,9 +120,12 @@
 		 * lands in a defined state; only the unusable input goes. */
 		/delete-property/ alarm-gpios;
 
-		/* Lets a future thermal zone bind the fan as a cooling device.
-		 * Inert today - this board has no temperature sensor the
-		 * thermal framework can consume (PORTING.md 3.3). */
+		/* Lets a thermal zone bind the fan as a cooling device. Paired
+		 * with #thermal-sensor-cells on the LM75 at the bottom of this
+		 * file, in-kernel thermal control of the fan is possible - see
+		 * that node's comment. Nothing declares a zone yet: the fan is
+		 * still steered from userspace by ds410j-fan-control.sh, which
+		 * reads both the board sensor and per-drive temperatures. */
 		#cooling-cells = <2>;
 	};
 
@@ -184,163 +180,12 @@
 			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
 		};
 	};
-
-	/* DIAGNOSTIC, round 2. See note 5 in the header.
-	 *
-	 * Round 1 (MPP12/20/21) came back negative, and the search that had
-	 * "cleared" everything else turned out to be broken: gpioinfo reports
-	 * nearly every line as an OUTPUT, so gpioget was reading the output latch
-	 * rather than the pad. The only lines it ever read honestly were the three
-	 * that gpio-keys had already claimed and set to input.
-	 *
-	 * So this claims every remaining pin that could actually be a button, which
-	 * forces each to gpio and to input. Keycodes are 600 + the GPIO number, so
-	 * a press names its own pin and no code collides with anything meaningful
-	 * (KEY_MAX is 767). Deliberately NOT KEY_POWER: logind would shut the box
-	 * down on a spurious event from a pin that is really an output.
-	 *
-	 * Excluded, and the exclusions matter more than the inclusions:
-	 *   29 30 31 34 44 45  DRIVE POWER ENABLES (pmx_hdd*_pwr_* in
-	 *                      kirkwood-synology.dtsi). Flipping these to input
-	 *                      could cut power to fitted disks.
-	 *   5 7 18 19 33       "gpo" on every 88F6281 variant - output-only, so
-	 *                      they can never be a button. 33 in particular would
-	 *                      have failed the pinctrl apply and taken the whole
-	 *                      node down with it.
-	 *   12 20 21           round 1, conclusively negative.
-	 *   0-3 8-11 13 14     SPI, i2c, uart0, uart1.
-	 *   15-17 36-43        fan and bay LEDs, in use.
-	 */
-	gpio-keys-candidates {
-		compatible = "gpio-keys";
-		pinctrl-0 = <&pmx_ds410j_buttons>;
-		pinctrl-names = "default";
-
-		key-gpio4 {
-			label = "ds410j candidate gpio4";
-			linux,code = <604>;
-			gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio22 {
-			label = "ds410j candidate gpio22";
-			linux,code = <622>;
-			gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio23 {
-			label = "ds410j candidate gpio23";
-			linux,code = <623>;
-			gpios = <&gpio0 23 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio24 {
-			label = "ds410j candidate gpio24";
-			linux,code = <624>;
-			gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio25 {
-			label = "ds410j candidate gpio25";
-			linux,code = <625>;
-			gpios = <&gpio0 25 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio26 {
-			label = "ds410j candidate gpio26";
-			linux,code = <626>;
-			gpios = <&gpio0 26 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio27 {
-			label = "ds410j candidate gpio27";
-			linux,code = <627>;
-			gpios = <&gpio0 27 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio28 {
-			label = "ds410j candidate gpio28";
-			linux,code = <628>;
-			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio32 {
-			label = "ds410j candidate gpio32";
-			linux,code = <632>;
-			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio35 {
-			label = "ds410j candidate gpio35";
-			linux,code = <635>;
-			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio46 {
-			label = "ds410j candidate gpio46";
-			linux,code = <646>;
-			gpios = <&gpio1 14 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio47 {
-			label = "ds410j candidate gpio47";
-			linux,code = <647>;
-			gpios = <&gpio1 15 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio48 {
-			label = "ds410j candidate gpio48";
-			linux,code = <648>;
-			gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-
-		key-gpio49 {
-			label = "ds410j candidate gpio49";
-			linux,code = <649>;
-			gpios = <&gpio1 17 GPIO_ACTIVE_LOW>;
-			debounce-interval = <50>;
-		};
-	};
 };
 
 /* See note 1. */
 &{/gpio-leds-hdd-36} {
 	status = "disabled";
 };
-
-/* See note 5. Our U-Boot is ds109_defconfig, whose MPP table sets MPP12_GPO
- * (output only), MPP20_SATA1_ACTn and MPP21_SATA0_ACTn. Kirkwood has one pinmux
- * block - MPP_CTRL0..6 at 0xF1010000, 4 bits per pin - and Linux only rewrites
- * the fields it has a consumer for, so pins nothing claims keep whatever the
- * bootloader left. Claiming them here is what puts them back to gpio; no U-Boot
- * change is needed.
- *
- * MPP20/21 are free to take because this board's SATA is the PCIe 88SX7042 and
- * both &sata and &eth1 are disabled above - they were the two nodes that used to
- * fight over MPP21.
- */
-&pinctrl {
-	pmx_ds410j_buttons: pmx-ds410j-buttons {
-		marvell,pins = "mpp4", "mpp22", "mpp23", "mpp24", "mpp25",
-				"mpp26", "mpp27", "mpp28", "mpp32", "mpp35",
-				"mpp46", "mpp47", "mpp48", "mpp49";
-		marvell,function = "gpio";
-	};
-};
-
 
 /* See note 3. Unpopulated on this chassis, and pmx_sata0 claims MPP21, which
  * pmx_ge1 also wants. */

@@ -1,5 +1,9 @@
 # ksmbd - the in-kernel SMB3 server (PORTING.md §7.2.3).
 #
+# WIP - the module is flashed and the kernel side loads, but ksmbd.mountd exits 1
+# on startup and it has not served a file yet. Next lead: ksmbd.adduser logs
+# "No configuration file", so check the config path mountd is actually passed.
+#
 # WHY NOT SAMBA. Both cross-build for armv5tel, but the closures decide it:
 # Samba 4.23.10 is 97 paths / 408 MB and drags a whole python3 for armv5tel into
 # the image, while ksmbd-tools is 10 paths / 63 MB with no Rust and no Python -
@@ -20,7 +24,9 @@
 # THE TRANSPORT MATTERS MORE THAN THE CIPHER (§7.2.3). sshd caps transfers at
 # 4.9 MB/s on this box - CPU-bound, not link-bound, so a gigabit link does not
 # help it. SMB without signing or encryption should hand the disk path back its
-# throughput, which is the whole reason this exists.
+# throughput, which is the whole reason this exists - still a prediction, not a
+# measurement. Whenever it is measured, note that the bench link is 100 Mb/s
+# (OPERATIONS.md), so ~11.7 MB/s is the ceiling here regardless of the cipher.
 { config, lib, pkgs, ... }:
 
 let

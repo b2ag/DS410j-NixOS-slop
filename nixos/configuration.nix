@@ -174,19 +174,24 @@ in
 
       # Fan control. The DS410j fan is a 3-bit GPIO speed select on GPIO0
       # 15/16/17 and gpio-fan is the driver for exactly that shape of hardware,
-      # but nixpkgs' armv5 defconfig leaves SENSORS_GPIO_FAN unset, so until now
-      # there was no gpio-fan driver at all - a correct device tree on its own
-      # would still have given no fan control. Built in, not a module: the
-      # driver registers a devm action that sets speed 0 (= fan OFF) on removal,
-      # and an rmmod that silently stops the fans on a box with no thermal
-      # sensor is not a failure mode worth having.
+      # but nixpkgs' armv5 defconfig leaves SENSORS_GPIO_FAN unset, so until this
+      # was set there was no gpio-fan driver at all - a correct device tree on
+      # its own would still have given no fan control. Built in, not a module:
+      # the driver registers a devm action that sets speed 0 (= fan OFF) on
+      # removal, and an rmmod that silently stops the fans on a box with four
+      # drive bays is not a failure mode worth having.
       SENSORS_GPIO_FAN = yes;
 
-      # The only temperature source on this board. There is no hwmon device of
-      # any kind here (PORTING.md 3.3); drivetemp reads each SATA drive's own
-      # sensor over SCT/SMART and presents it as hwmon, which is what
-      # ds410j-fan-control.sh steers by. The alternative was smartmontools in
-      # userspace - a C++ cross build in a closure with no binary cache.
+      # Per-drive temperatures. drivetemp reads each SATA drive's own sensor
+      # over SCT/SMART and presents it as hwmon; the alternative was
+      # smartmontools in userspace - a C++ cross build in a closure with no
+      # binary cache.
+      #
+      # This was once "the only temperature source on this board", on the belief
+      # that there was no hwmon device here at all. There is: an LM75 at I2C 0x48
+      # (PORTING.md 3.3, declared in kirkwood-ds410j.dts). Both are wanted -
+      # ds410j-fan-control.sh steers on the board sensor and the drives together,
+      # since a hot drive and a hot chassis are different faults.
       SENSORS_DRIVETEMP = yes;
 
       # Bay LEDs. LEDS_GPIO is already on via nixpkgs' common config, but the

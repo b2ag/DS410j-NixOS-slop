@@ -10,11 +10,17 @@
 #   3 long beep     5 power LED blinking   8 status green  : ; status orange
 #                   6 power LED off
 #
-# SAFETY: this helper accepts only the codes above. It will not send '1', which
-# powers the box off, nor 't', which is unidentified and appears in DSM's
-# shutdown path. Nothing running as a system service should be able to cut power
-# by getting a character wrong, and warm reboot is not solved yet on this board
-# (PORTING.md 3.3) - an accidental poweroff needs a human at the front panel.
+# SAFETY: this helper accepts only the codes above - lamps, buzzer, nothing else.
+# It will not send '1', which powers the box off, nor 't', which is unidentified
+# and appears in DSM's shutdown path. The reason is unchanged by warm reboot now
+# working: a soft-off DS410j stays off and needs a human at the front panel
+# (PORTING.md 3.3), so an accidental '1' from a system service strands the box.
+#
+# It will not send 'C' either, even though that is the working warm-reboot
+# command. Restarting is not a lamp operation: it belongs to the synology-mcu
+# driver's SYS_OFF_MODE_RESTART handler, which is what makes `systemctl reboot`
+# work, so that a reboot goes through shutdown rather than cutting the box off
+# mid-write.
 set -u
 
 # Preferred transport: the synology-mcu driver's debugfs interface. Once that

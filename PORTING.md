@@ -1491,26 +1491,18 @@ cryptsetup, lvm2, btrfs-progs and ksmbd-tools all require rebuilding the image
 with a larger root partition and **reflashing the USB stick** — which no longer
 needs a human at the bench, see §7.2.5. Budget ~100 s of writing per reflash.
 
-**`nixos/ksmbd.nix` is now flashed and boots, but the service FAILS**
-[CONFIRMED 2026-09-05]. It went onto the stick as part of the flasher's first
-live run, so its "evaluates, has never served a file" status is now sharper: the
-module loads fine but the daemon dies on startup and the system is `degraded`.
+**`nixos/ksmbd.nix` — WIP, now flashed and booting.** It went onto the stick as
+part of the flasher's first live run (§7.2.5), which moves it on from "evaluates,
+never run": the kernel side loads — `lsmod` shows `ksmbd 311296 0` with
+`cifs_arc4` and `nls_ucs2_utils`, so `CONFIG_SMB_SERVER=m` via
+`boot.kernelPatches` did its job — but `ksmbd.mountd` logs `Started manager`,
+`Started worker`, `Terminated` and exits 1, so the service does not stay up and
+the system reads `degraded`.
 
-- The kernel side is fine: `lsmod` shows `ksmbd 311296 0` with `cifs_arc4` and
-  `nls_ucs2_utils` pulled in, so `CONFIG_SMB_SERVER=m` via `boot.kernelPatches`
-  did what it was meant to.
-- The userspace side does not survive: `ksmbd.mountd` logs
-  `INFO: Started manager`, then `INFO: Started worker`, then
-  **`INFO: Terminated`** and exits 1. systemd restarts it ten times and gives up
-  with `start-limit-hit`.
-- The likely lead, from the same journal: `ksmbd.adduser` logs
-  **`INFO: No configuration file`** just before writing the password db. So the
-  generated `/etc/ksmbd/ksmbd.conf` is probably not where the tools look, or is
-  not readable at the point they look — consistent with `/etc` being tmpfs here
-  and the db being rebuilt into `/run` on every boot. Check the path
-  `ksmbd.mountd` is actually passed before changing anything else.
-
-This is unrelated to the flasher; it is the next thing to fix in this section.
+Next lead, from the same journal: `ksmbd.adduser` logs
+**`No configuration file`** just before writing the password db, so check the
+config path `ksmbd.mountd` is actually passed — plausibly tangled with `/etc`
+being tmpfs here. Nothing measured for throughput yet.
 
 ### 7.2.5 Remote reflashing of the USB stick — DONE [CONFIRMED 2026-09-05]
 

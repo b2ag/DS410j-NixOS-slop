@@ -1,15 +1,22 @@
 # TFTP-bootable USB-stick flasher for the DS410j.
 #
 # THE POINT: until this existed, every image change needed a human to pull the
-# USB stick and dd it (CLAUDE.md: "a bad image still needs a human"). This boots
-# entirely from RAM over TFTP, streams the new image from HTTP straight onto the
-# stick, verifies it, and asks the MCU to restart the board - so a reflash is a
-# remote operation.
+# USB stick and dd it. That was the project's last human dependency, and
+# CLAUDE.md said so in as many words until 2026-09-05. This boots entirely from
+# RAM over TFTP, streams the new image from HTTP straight onto the stick,
+# verifies it by reading it back, and asks the MCU to restart the board - so a
+# reflash is now a remote operation. [CONFIRMED on hardware 2026-09-05: 699 MB
+# written in 99 s, sha256 verified, box back at a login prompt.]
 #
 # WHY IT IS SAFE. The two-stage bootloader chain is in SPI flash, not on the
 # stick. A failed or interrupted write cannot brick anything: our U-Boot finds no
 # bootflow, drops to its prompt, and this flasher can simply be booted again.
-# Nothing here writes to MTD, ever.
+# Nothing is written until the flasher has booted, so a flasher that fails to
+# come up costs nothing - the old stick is untouched.
+#
+# It also cannot write to MTD or to a SATA drive, and that is structural rather
+# than careful: the kernel below is built with ATA and MTD switched off, so there
+# is no code in it that could reach the bays or the SPI flash. See the flags.
 #
 # Build:  nix-build /src/kernel/flasher.nix
 # Use:    see OPERATIONS.md, "Flashing the USB stick without a human"

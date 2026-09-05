@@ -1,10 +1,18 @@
 # Fan and bay-LED control for the DS410j.
 #
-# The board has no temperature sensor of its own (PORTING.md 3.3), so the fan
-# cannot be driven from the kernel's thermal framework - there is nothing for a
-# thermal zone to read. CONFIG_SENSORS_DRIVETEMP turns each SATA drive's own
-# sensor into an ordinary hwmon device, which is enough to steer by and costs
-# nothing in the closure, and this daemon closes the loop in userspace.
+# This daemon exists in userspace, and the reason is now historical rather than
+# technical. It was built on CONFIG_SENSORS_DRIVETEMP - which turns each SATA
+# drive's own sensor into an ordinary hwmon device, cheaply - because the board
+# was believed to have no temperature sensor of its own, so there was said to be
+# nothing for a thermal zone to read.
+#
+# That was wrong: there IS an LM75-compatible part at I2C 0x48, found by reading
+# DSM (PORTING.md 3.3), and kirkwood-ds410j.dts declares it with
+# #thermal-sensor-cells against gpio-fan's #cooling-cells. So an in-kernel
+# thermal zone is possible now. It is deliberately not used: this daemon steers
+# on the board sensor AND per-drive temperatures together, and it also owns the
+# bay LEDs, whose anti-parallel wiring no in-kernel binding can express (see the
+# DTS header). A thermal zone would cover the fan and leave the rest here.
 { config, lib, pkgs, ... }:
 
 let

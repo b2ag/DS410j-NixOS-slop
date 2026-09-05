@@ -8,11 +8,13 @@ Porting mainline Linux + NixOS onto a Synology DS410j (Marvell Kirkwood 88F6281,
 armv5tel, 118 MB usable RAM, **Marvell U-Boot 1.1.4** bootloader, 4 MB SPI NOR flash).
 
 **Status: working.** The box cold-boots unattended to NixOS 26.11 on kernel 6.12.104 -
-serial login and ssh, `systemctl is-system-running` reports `running` with zero failed
-units. There are nix builds for the kernel (`kernel/`), U-Boot (`uboot/`) and the
+serial login and ssh. `systemctl is-system-running` reported `running` with zero failed
+units until ksmbd was added; it currently reports **`degraded`**, and the single failed
+unit is the WIP `ksmbd.service` (see `PORTING.md` §7.2.3). Nothing else regressed.
+There are nix builds for the kernel (`kernel/`), U-Boot (`uboot/`) and the
 cross-compiled NixOS image (`nixos/`), plus bench helper scripts and verified flash
-backups. The only tests are `nixos/test-fan-control.sh` (40 assertions against a
-fake sysfs).
+backups. Tests are `nixos/test-fan-control.sh` (55 assertions) and
+`kernel/test-flash-init.sh` (21), both against fake sysfs trees, no hardware.
 
 Fan control, the bay LEDs and the front panel **work and are boot-tested on the
 hardware** (2026-09-03; evidence in `PORTING.md` §0). Remaining work is in

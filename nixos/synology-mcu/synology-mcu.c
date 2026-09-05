@@ -319,9 +319,11 @@ static void mcu_handle(struct syno_mcu *mcu, u8 byte)
 		mcu->n_reset++;
 		dev_info(mcu->dev, "reset button\n");
 		/*
-		 * KEY_RESTART, not a reboot: warm reboot does not work on this
-		 * SoC (PORTING.md 3.3), so whatever userspace policy picks up
-		 * this key is where the decision belongs, not here.
+		 * KEY_RESTART, not a reboot from in here. Warm reboot DOES work
+		 * on this board - this driver's own SYS_OFF_MODE_RESTART handler
+		 * sends 'C', see mcu_restart() - but whether a button press
+		 * should reboot the box is policy, and policy belongs to
+		 * whatever picks up this key, not to an interrupt handler.
 		 */
 		mcu_key(mcu, KEY_RESTART);
 		break;
