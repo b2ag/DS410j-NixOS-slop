@@ -68,7 +68,26 @@ in
     ./mcu-driver.nix    # synology-mcu: buttons -> input events, MCU debugfs
     ./mcu-panel.nix     # front-panel power/status lamps, via the board MCU
     ./readonly-root.nix # ro root + tmpfs for everything activation writes
+    ./ksmbd.nix         # in-kernel SMB3 server; see PORTING.md §7.2.3 for why
+                        # ksmbd rather than Samba (408 MB closure, does not fit)
   ];
+
+  # SMB, not sftp. sshd caps transfers at 4.9 MB/s on this CPU - and that is
+  # CPU-bound, not link-bound, so the board's gigabit link does not help it
+  # (PORTING.md §7.2.2). Signing and encryption stay off for the same reason;
+  # the data at rest is LUKS's job, not the wire's.
+  services.ds410j-ksmbd = {
+    enable = true;
+    user = "nas";
+    # The root filesystem is read-only, so a share has to live on the data
+    # volume. This path is where the encrypted btrfs is expected to be mounted;
+    # ksmbd will refuse the share if it does not exist.
+    shares.data = {
+      path = "/srv/data";
+      comment = "DS410j data";
+      validUsers = [ "nas" ];
+    };
+  };
 
   #### Cross compilation ######################################################
   # MUST match pkgsCross.armv5tel-multiplatform exactly - that attribute is

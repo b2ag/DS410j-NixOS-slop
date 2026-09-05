@@ -825,6 +825,60 @@ on every boot because `/etc` is a tmpfs - so expect the host-key warning and use
 `-o UserKnownHostsFile=/dev/null`.
 
 
+## Flashing the USB stick without a human — UNTESTED, work in progress
+
+**Status 2026-09-05: written, not yet run.** `kernel/flasher.nix` and
+`kernel/flash-init.sh` exist and evaluate; the kernel had not finished building
+when this was written and **nothing here has been booted or verified on the
+hardware**. Treat every claim below as intent, not fact, until it has been.
+
+The goal is to remove the one remaining human dependency in this project.
+CLAUDE.md says "a bad image still needs a human"; this is the answer to that. The
+flasher is a TFTP-bootable kernel with an embedded busybox initramfs that runs
+entirely in RAM, streams a new image onto the USB stick, verifies it, and asks
+the MCU to restart the board.
+
+**Why it is safe to attempt.** The two-stage bootloader chain lives in SPI flash,
+not on the stick. A failed or interrupted write cannot brick anything: our U-Boot
+finds no bootflow, drops to its prompt, and the flasher can simply be booted
+again. The flasher never touches MTD.
+
+**Why it streams.** The image is ~680 MB against 118 MB of RAM, so it can never
+be buffered - `wget -O - | dd of=/dev/sda bs=1M` is not a stylistic choice.
+
+Intended use, once it works:
+
+```
+tftpboot 0x00800000 zImage-flasher
+tftpboot 0x02000000 ds410j.dtb
+setenv bootargs 'console=ttyS0,115200n8 flash.url=http://192.168.50.1:8080/ds410j-nixos.img
+                 flash.sha256=<hex> flash.size=<bytes> flash.dev=/dev/sda flash.ip=192.168.50.60'
+bootz 0x00800000 - 0x02000000
+```
+
+It builds two images on purpose, because a recovery tool must not depend on our
+own U-Boot in mtd1 being healthy:
+
+- `zImage` — for our U-Boot 2026.07, `bootz` with a separate DTB.
+- `uImage` — for the **stock** Marvell 1.1.4, which has no `fdt` command, so the
+  DTB is appended and the whole thing wrapped as `IH_TYPE_KERNEL`.
+
+**The open problem: how to serve 680 MB to the box.** The flasher currently
+expects plain HTTP, but running an HTTP server in this container was refused by
+the sandbox. Options, none yet tried:
+
+1. Have the *box* listen and the container push - `nc -l -p 9000 | dd of=/dev/sda`
+   on the DS410j, `cat img | nc 192.168.50.60 9000` from here. Needs no server on
+   the container side at all, which is why it is the favourite.
+2. dnsmasq's TFTP, which is already running - but classic TFTP's 16-bit block
+   counter caps a transfer at 32 MB (about 96 MB with `blksize` negotiation), so
+   a 680 MB image does not fit without block-counter rollover. Probably a dead
+   end.
+3. Grant the container permission to run an HTTP server.
+
+Whichever is chosen, `flash-init.sh` needs its transfer step adjusted to match;
+everything else in it is transport-agnostic.
+
 ## Iterating on U-Boot
 
 `nix-build /src/uboot` produces a raw `u-boot.bin`. Two ways to run it:
